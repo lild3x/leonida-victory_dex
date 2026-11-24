@@ -5621,6 +5621,19 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // shortcut: `VICTORY_RT_STUB`. A ray-tracing program that picks its
+            // structure's descriptor by a computed index (the shadow-ray programs)
+            // walks the memory behind it from the descriptor's address, which the
+            // host cannot give for a computed slot. With the switch the address
+            // reads as zero: the walk finds no geometry, every ray misses, and the
+            // light it would have blocked is not blocked.
+            if count <= 4 && std::env::var_os("VICTORY_RT_STUB").is_some() {
+                for k in 0..count {
+                    let zero = self.s.m.i32(0);
+                    self.write(inst, Reg::S(code + k as u8), zero, None);
+                }
+                return Ok(());
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
