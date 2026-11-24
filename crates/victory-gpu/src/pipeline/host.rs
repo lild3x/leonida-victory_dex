@@ -826,7 +826,12 @@ fn root_signature(
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
-        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+        if let Err(e) = victory_shader::emit::agility::serialize_versioned_root_signature(
+            device,
+            &desc,
+            &mut blob,
+            Some(&mut error),
+        ) {
             if let Some(error) = error {
                 let text = std::slice::from_raw_parts(
                     error.GetBufferPointer().cast::<u8>(),

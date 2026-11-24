@@ -126,7 +126,9 @@ What each part does today and what it still needs:
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+`rust-toolchain.toml`). On Windows 10 (22H2 with KB5029331 or newer), place a
+DirectX 12 Agility SDK `D3D12\D3D12Core.dll` beside `victory.exe` or set
+`VICTORY_D3D12_AGILITY=<dir>`.
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
