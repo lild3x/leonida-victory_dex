@@ -1264,6 +1264,15 @@ fn trace_missing() -> bool {
     })
 }
 
+/// shortcut: `VICTORY_POPS_SKIP` is set. Pixel programs that use the console's
+/// POPS (primitive ordered pixel shading) run without its ordering: overlapping
+/// fragments of different primitives are no longer processed in primitive
+/// order. Nothing else of the program changes.
+fn pops_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POPS_SKIP").is_some())
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -2207,6 +2216,16 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // shortcut: `VICTORY_POPS_SKIP`. A pixel program that orders itself
+                    // with POPS reads a hardware SGPR whose bit 31 says whether it must
+                    // wait for the waves before it; zero says it need not, and the code
+                    // then jumps over its wait loop.
+                    None if pops_skip()
+                        && self.x.native.stage == HwStage::Ps
+                        && self.uses_pops() =>
+                    {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3059,12 +3078,25 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // shortcut: `VICTORY_POPS_SKIP`, see `pops_skip`.
+            Operand::Const(239) if pops_skip() => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
         }
+    }
+
+    /// Whether the program orders its pixels with the console's POPS
+    /// (primitive ordered pixel shading): it reads `src_pops_exiting_wave_id`.
+    fn uses_pops(&self) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(&i.fields, Fields::Sop { src, .. }
+                    if src.iter().any(|s| matches!(s, Operand::Const(239))))
+            })
+        })
     }
 
     /// An operand read as f16 data: GFX10 puts an inline f16 constant in
