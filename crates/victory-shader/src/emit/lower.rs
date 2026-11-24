@@ -86,9 +86,31 @@ enum Stop {
     Fail(ShaderError),
 }
 
+thread_local! {
+    /// `VICTORY_SHADER_TRACE_MISSING`: (offset, instruction, reason) of the
+    /// instructions without effects that failed in the current attempt.
+    static MISSING: std::cell::RefCell<Vec<(usize, String, Why)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Prints, as one block, the failed instructions whose reason is `what`.
+fn report_missing(offset: usize, what: Why) {
+    let lines: Vec<String> = MISSING.with_borrow(|m| {
+        m.iter()
+            .filter(|(_, _, why)| *why == what)
+            .map(|(at, name, _)| format!("  {name} at {at:#x}"))
+            .collect()
+    });
+    eprintln!(
+        "victory-shader: {what} (read at {offset:#x}), from:\n{}",
+        lines.join("\n")
+    );
+}
+
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
+        MISSING.with_borrow_mut(Vec::clear);
         match Lower::new(parts, &bad).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
@@ -99,7 +121,14 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                     });
                 }
             }
-            Err(Stop::Fail(e)) => return Err(e),
+            Err(Stop::Fail(e)) => {
+                if trace_missing()
+                    && let ShaderError::Unsupported { offset, what } = e
+                {
+                    report_missing(offset, what);
+                }
+                return Err(e);
+            }
         }
     }
 }
@@ -1219,6 +1248,20 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
         }
     }
     partners
+}
+
+/// With the `diagnostics` feature, whether `VICTORY_SHADER_TRACE_MISSING` is
+/// set. An instruction without side effects that cannot be translated does not
+/// fail the program: its results are marked missing and the program fails
+/// only where something with an effect (a store, an export, a branch) reads
+/// one, which reports that reader's offset. When a program fails, the trace
+/// lists the instructions that gave the error's reason (one block, so that
+/// programs translated on several threads do not interleave).
+fn trace_missing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_SHADER_TRACE_MISSING").is_some()
+    })
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -4675,6 +4718,9 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                if trace_missing() {
+                    MISSING.with_borrow_mut(|m| m.push((offset, name.to_string(), why)));
+                }
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
