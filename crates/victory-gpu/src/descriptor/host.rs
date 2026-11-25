@@ -4322,3 +4322,13 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
     }
 }
+
+/// Largest constant buffer view D3D12 takes (4096 16-byte elements). A
+/// title view past it (a shader only reads its first 64 KiB) made an
+/// invalid view that removed NVIDIA's device (0x887A0001).
+const MAX_CBV_BYTES: u32 = 65_536;
+
+/// The host size of a constant buffer view of `size` bytes.
+fn cbv_size(size: u32) -> u32 {
+    size.next_multiple_of(256).min(MAX_CBV_BYTES)
+}
