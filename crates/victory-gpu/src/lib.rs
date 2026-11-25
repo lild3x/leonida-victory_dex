@@ -84,6 +84,10 @@ mod watch;
 #[cfg(windows)]
 mod texback;
 #[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
+mod pixels;
+#[cfg(windows)]
 mod layers;
 
 #[cfg(windows)]
