@@ -858,7 +858,7 @@ struct TwinUse {
 ///
 /// A 16-bit twin holds whole steps of 1/65535, and the depth written is
 /// the step times the float nearest 1/65535 (0x37800080). That is how
-/// Grand Theft Auto VI's tiled lighting computes the depth of the
+/// The title's tiled lighting computes the depth of the
 /// rectangles it then draws with the test "equal", one class of materials
 /// a draw (all six of its vertex shaders multiply the class number by that
 /// constant), so the pass and the draw give the host the same float, and
@@ -1179,7 +1179,7 @@ fn record_twin_copy(
     // shortcut: the depth plane's twin is not given the plane (that is a
     // pass the other way: the plane read by a shader, the twin as its
     // target). The twin then lacks what draws and clears wrote to the
-    // plane since shaders last wrote the twin. In Grand Theft Auto VI
+    // plane since shaders last wrote the twin. In the title
     // nothing writes that plane but the twin's pass (its 192 draws against
     // it only test, run 29), so the twin lacks nothing. Counted.
     if colour && twin.plane.is_some() {
@@ -4717,7 +4717,7 @@ impl HostList {
     /// are given what was written, and left readable by shaders. Shaders
     /// that pick a view from the heap by a computed index are not seen by
     /// `twin_use` and read the depth texture in lists that never name it
-    /// (in a captured frame of Grand Theft Auto VI no table names a shadow
+    /// (in a captured frame of the title no table names a shadow
     /// map for reading but the pass that fills the next one).
     fn twins_to_depth(&self) {
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -5843,6 +5843,15 @@ impl Meter {
                     crate::descriptor::host::STALE[2].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                );
+                let [views, shown, waiting, tables, gone, own, free, start, other, shows, back] =
+                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(|i: usize| crate::descriptor::host::SWEPT[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "placed texture views in the heap at the last look: {views}, of them {shown} shown, {waiting} in the queue, \
+                     {tables} read through tables, {gone} without memory; with memory and nothing to bring them up to date: \
+                     {own} of their own memory, {free} of memory no other view describes, {start} of memory another texture \
+                     begins at, {other} of another's memory ({shows} of all these show another view); {back} put back into the \
+                     queue since the start"
                 );
             }
             #[cfg(feature = "diagnostics")]

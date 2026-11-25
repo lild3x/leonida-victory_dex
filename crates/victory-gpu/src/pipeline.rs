@@ -4,7 +4,7 @@
 //! types.
 //!
 //! Host pipelines are made on a pipeline's first draw, not at creation:
-//! Grand Theft Auto VI creates some 60,000 pipelines in its first 20
+//! The title creates some 60,000 pipelines in its first 20
 //! seconds and draws with a few dozen (decision 0007, step 3). Shader
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
@@ -116,6 +116,28 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
         })
         .clone()
+}
+
+#[cfg(windows)]
+pub(crate) use host::depth_bounds_test;
+
+/// Puts the translation of a container of the title's into the cache on
+/// disk, and with `compute` its host pipeline into the driver's, before any
+/// run wants them. Whether it translated, and whether it has a pipeline
+/// (`None`: not asked for, or left out).
+#[cfg(windows)]
+pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Option<bool>) {
+    let full = blake3::hash(container);
+    // Not through the table, which lets nothing go.
+    let shader = Arc::new(Shader {
+        stage,
+        hash: full.to_hex()[..16].to_owned(),
+        container: container.to_vec(),
+        translated: OnceLock::new(),
+    });
+    let translated = shader.translated().is_some();
+    let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
+    (translated, made)
 }
 
 /// A translated shader and the console resources its code reads.
@@ -787,7 +809,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
-    /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
+    /// The stream layout the title builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample
     /// mask, rasterizer, depth-stencil 1, sample description, input layout,
     /// topology, render target and depth formats: 0x2b0 bytes.

@@ -1,14 +1,50 @@
-# victory-gta6
+# VIctory fork (work in progress)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
-compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
-natively on Windows from files the user supplies. This fork follows upstream
+## victory-amd
+
+This copy is a fork of
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork), itself a fork
+of [VIctory](https://github.com/Marvisak/VIctory). It adds fixes found while
+running on an AMD card, tested on one machine only: Windows 11, Radeon RX 7800 XT
+16 GB (driver 32.0.32029.2010), Ryzen 5 7500F, 32 GB RAM.
+
+State on that machine (2026-11-25, Series X profile): the prologue's cutscene and
+the first room are drawn, with the player moving, at 2 to 3 frames per second.
+Runs of 8 minutes mostly end without a device loss; one ended with
+`DXGI_ERROR_DEVICE_HUNG` after about 5 and a half minutes, cause unknown. Lamps
+were dark in one run. The room's walls were missing in two others, one before a fix
+that is here (the early pipeline list) and one with changes that are not. Ray-traced
+light does not run.
+
+What it changes over `victory-fork` (each is explained in a comment where it is):
+
+- Texture views are told apart by the memory their mips really take, so textures
+  streamed in part are not taken for one another and are uploaded from their first
+  mip that is there.
+- Views of placed textures the host lost sight of are put back
+  (`VICTORY_TEXTURE_SWEEP`).
+- Dispatches of more than 65,535 groups are made in two parts (the final gather at
+  2560x1440 asks for 115,200).
+- DirectStorage requests read their page array when they run, and wait for it.
+- The list of pipelines to make early keeps what earlier runs listed, and compute
+  pipelines get their own waiting time while a world loads.
+- View indices past the host heap are clamped on AMD too.
+- Programs that stop the AMD driver's compiler, or take it minutes and tens of GB,
+  are left out (ray-tracing resolves).
+- Diagnostics: `VICTORY_NULL_MAGENTA`, `victory warm`, more captures.
+
+Parts of it were prompted by pull requests and issues of VIctory and victory-fork;
+the code was written anew. Developed with [Claude Code](https://claude.com/claude-code).
+
+A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
+compatibility layer that runs an Xbox Series title natively on Windows from
+files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by Rockstar Games or
-Take-Two Interactive.
+copy of the game. It is not affiliated with or endorsed by the game's
+developer or publisher.
 
 ## Credits
 
@@ -80,7 +116,7 @@ status section describes upstream, not this fork.
 
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+Runs the title (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
