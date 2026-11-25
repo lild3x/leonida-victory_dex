@@ -6396,6 +6396,7 @@ impl HostList {
     /// through unordered access: if it is of a kind copied back
     /// ([`crate::texback`]), the list copies it when it closes.
     pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        crate::texback::note_kind(resource);
         if !crate::texback::wanted(resource) {
             return;
         }

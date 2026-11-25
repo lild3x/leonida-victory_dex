@@ -109,7 +109,10 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, resource: This, texture: 
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n = COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(copied = n, "textures copied back into title memory so far (VICTORY_TEXTURE_BACK)");
+    }
     Some(Back { buffer, footprints, rows, mips, layout, at, size })
 }
 
@@ -147,4 +150,21 @@ pub(crate) fn land(back: &Back) {
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
     crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
+}
+
+/// Logs, once per kind, square textures of 64 to 256 texels that shaders
+/// write (to check `VICTORY_TEXTURE_BACK`'s kinds against this tree's).
+pub(crate) fn note_kind(resource: This) {
+    let Some(k @ (w, h, _)) = crate::resource::texture_kind(resource) else {
+        return;
+    };
+    if !(w == u64::from(h) && (64..=256).contains(&w)) {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Vec<(u64, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&k) && seen.len() < 64 {
+        seen.push(k);
+        tracing::info!(width = w, height = h, format = k.2, wanted = kinds().contains(&k), "a texture kind shaders write");
+    }
 }
