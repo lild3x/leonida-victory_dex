@@ -59,6 +59,8 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// Write marks: 0 none, 1 every buffer write marked, 2 some unmarked.
+    pub marks: u8,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -105,6 +107,13 @@ fn report_missing(offset: usize, what: Why) {
         "victory-shader: {what} (read at {offset:#x}), from:\n{}",
         lines.join("\n")
     );
+}
+
+/// Write marks (`VICTORY_VIEW_MARKS=1`; off by default): see `SLOT_MARKS`.
+/// Part of the shader cache's key.
+pub fn view_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_some_and(|v| v == "1"))
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
@@ -2077,7 +2086,7 @@ impl<'a> Lower<'a> {
             // rounds every addition to 16 bits. (the title's
             // neural networks, CS_TransposeVecMatMulAlignedOperation, in a
             // block only the lanes inside the matrix reach.)
-            return Ok(self.half_sum_here(x));
+            return Ok(self.half_sum_present(x));
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -2103,6 +2112,61 @@ impl<'a> Lower<'a> {
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
         Ok(self.s.m.bin(c, Bin::Or, first, total))
+    }
+
+    /// [`Self::half_sum`] in one host wave of 64 where some lanes have left (a thread past
+    /// the end of the data returns early): the console runs the sum in every lane, a lane
+    /// outside EXEC with +0, so after step k every lane of an aligned run of 2^k lanes holds
+    /// that run's partial sum, the lanes that left included. A lane reads its partner run's
+    /// sum from the first lane of that run that is here, and +0 where none is (every lane of
+    /// the run left, so its terms were all +0). Lane 0's high half likewise: 0 if it left.
+    fn half_sum_present(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        self.s.flags |= flags::WAVE_OPS;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let here = self.s.m.bool(true);
+        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
+        let (blo, bhi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let [zero, k31, k32] = [0, 31, 32].map(|k| self.s.m.i32(k));
+        // The lanes of the run of `size` lanes at `base` that are here, from bit 0.
+        let present = |l: &mut Self, base: V, size: u32| -> V {
+            let upper = l.s.m.cmp(c, pred::IUGE, base, k32);
+            let word = l.s.m.select(c, upper, bhi, blo);
+            let at = l.s.m.bin(c, Bin::And, base, k31);
+            let bits = l.s.m.bin(c, Bin::LShr, word, at);
+            if size >= 32 {
+                bits
+            } else {
+                let m = l.s.m.i32((1u32 << size) - 1);
+                l.s.m.bin(c, Bin::And, bits, m)
+            }
+        };
+        let mut sum = x;
+        for step in 0..6u32 {
+            let size = 1u32 << step;
+            let (bit, run) = (self.s.m.i32(size), self.s.m.i32(!(size - 1)));
+            let other = self.s.m.bin(c, Bin::Xor, lane, bit);
+            let base = self.s.m.bin(c, Bin::And, other, run);
+            let bits = present(self, base, size);
+            // FirstbitLo (dx.op 32): the run's first lane that is here
+            let first = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[bits]);
+            let any = self.s.m.cmp(c, pred::NE, bits, zero);
+            let first = self.s.m.select(c, any, first, zero);
+            let from = self.s.m.bin(c, Bin::Add, base, first);
+            let theirs = self.read_lane(sum, from);
+            let theirs = self.s.m.select(c, any, theirs, zero);
+            sum = self.add_halves(sum, theirs);
+        }
+        let (high, low, one) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(1));
+        let lane0 = self.s.m.bin(c, Bin::And, blo, one);
+        let lane0 = self.s.m.cmp(c, pred::NE, lane0, zero);
+        let first = self.read_lane(x, zero);
+        let first = self.s.m.select(c, lane0, first, zero);
+        let first = self.s.m.bin(c, Bin::And, first, high);
+        let sum = self.s.m.bin(c, Bin::And, sum, low);
+        self.s.m.bin(c, Bin::Or, first, sum)
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -2194,7 +2258,16 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        // Any write the marks miss makes the program's marks unreliable (2),
+        // whether or not it also marked some (a program whose only writes
+        // are typed stores is not one that writes no buffer).
+        let marks = match (self.s.marked, self.s.unmarked) {
+            (_, true) => 2,
+            (true, false) => 1,
+            (false, false) => 0,
+        };
         Ok(Lowered {
+            marks,
             wave_size,
             cmp_samplers,
             root_cbvs,
@@ -2878,12 +2951,20 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            self.mark_address(lo, hi, 4 * u32::from(n));
             self.end_guarded(at, &[]);
             return Ok(());
         }
         let Some(op) = name.strip_prefix("global_atomic_") else {
             return Err(name);
         };
+        {
+            // Write marks (in the atomic's lanes; a mark in a lane that does
+            // not run only costs the host a compare).
+            let at = self.begin_guarded(guard);
+            self.mark_address(lo, hi, 8);
+            self.end_guarded(at, &[]);
+        }
         let d = data.as_ref().ok_or("global atomic data")?;
         let v = self.vgprs(inst, d, 1)?[0];
         // With `glc` the value from before comes back, in the result
@@ -4003,6 +4084,146 @@ impl<'a> Lower<'a> {
 
     /// Starts code only the lanes where `guard` holds run (a store under a
     /// lane guard): returns where it started and the join block.
+    /// A dword of the raw buffer `h` at byte `at`.
+    fn raw_dword(&mut self, h: V, at: V) -> V {
+        let c = self.cur;
+        let (iu, mask, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, at, iu, mask, align]);
+        let f = self.s.m.extract(c, r, 0);
+        self.as_int(f)
+    }
+
+    /// Write marks (`VICTORY_VIEW_MARKS=1`, `SLOT_MARKS`): marks the 64 KiB
+    /// pages a write of `bytes` bytes at byte `x` of the unordered buffer view
+    /// `h` touches, in the current block (inside the write's own lane guard):
+    /// the page bits of its first and last byte, each with an atomic OR only
+    /// where the bit is still clear. A handle that is no heap view (a root
+    /// view) cannot be marked: the program is then left to the host's
+    /// snapshots (`Shader::unmarked`).
+    fn mark_view_write(&mut self, h: V, x: V, bytes: u32) {
+        use super::shader::{SLOT_MARKS, VIEW_MARK_NONE, VIEW_WRITE_BITS};
+        if !view_marks() {
+            return;
+        }
+        // A root view's write: its entry comes from the host as user data.
+        let root = if self.s.view_index.contains_key(&h) {
+            None
+        } else {
+            match self.s.root_uavs.iter().find(|r| r.1 == h).map(|r| r.0) {
+                Some(slot) if slot < SLOT_MARKS => Some(slot),
+                _ => {
+                    self.s.unmarked = true;
+                    return;
+                }
+            }
+        };
+        self.s.marked = true;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let bitmap = self.s.root_uav_handle(SLOT_MARKS);
+        // A bound UAV outside compute and pixel programs must be declared.
+        if !matches!(self.x.native.stage, HwStage::Cs | HwStage::Ps) {
+            self.s.flags |= super::shader::flags::UAVS_AT_EVERY_STAGE;
+        }
+        let (base, phase) = match root {
+            Some(slot) => {
+                use super::shader::USER_VIEW_MARK;
+                let base = self.host_word(RootType::Other(USER_VIEW_MARK), slot, 0);
+                let phase = self.host_word(RootType::Other(USER_VIEW_MARK + 1), slot, 0);
+                (base, phase)
+            }
+            None => {
+                let index = self.s.view_index[&h];
+                let table = self.s.root_srv_handle(SLOT_MARKS);
+                let c = self.cur;
+                let (eight, four) = (k(self, 8), k(self, 4));
+                let at = self.s.m.bin(c, Bin::Mul, index, eight);
+                let base = self.raw_dword(table, at);
+                let c = self.cur;
+                let at = self.s.m.bin(c, Bin::Add, at, four);
+                (base, self.raw_dword(table, at))
+            }
+        };
+        let c = self.cur;
+        let none = k(self, VIEW_MARK_NONE);
+        let valid = self.s.m.cmp(c, pred::NE, base, none);
+        let first = self.s.m.bin(c, Bin::Add, phase, x);
+        let span = k(self, bytes.max(1) - 1);
+        let last = self.s.m.bin(c, Bin::Add, first, span);
+        // The bit wraps (title page number modulo VIEW_WRITE_BITS): two pages
+        // that share a bit only cost the host an extra compare, never a miss.
+        // A slot without an entry holds no buffer view (a null one): the
+        // card drops the write, there is nothing to mark. Every host slot
+        // made with a buffer view gets its entry (`HostHeap::set_mark`).
+        let (k16, mask) = (k(self, 16), k(self, VIEW_WRITE_BITS - 1));
+        let mut bits = Vec::new();
+        for byte in [first, last] {
+            let page = self.s.m.bin(c, Bin::LShr, byte, k16);
+            let n = self.s.m.bin(c, Bin::Add, base, page);
+            bits.push(self.s.m.bin(c, Bin::And, n, mask));
+        }
+        let outer = self.begin_guarded(Some(valid));
+        self.set_mark_bits(bitmap, [bits[0], bits[1]]);
+        self.end_guarded(outer, &[]);
+    }
+
+    /// Sets the bitmap bits `bits` (first and last page of a write), each
+    /// only where still clear: a load first, an atomic OR when clear.
+    fn set_mark_bits(&mut self, bitmap: V, bits: [V; 2]) {
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        for i in 0..2 {
+            let n = bits[i];
+            let c = self.cur;
+            let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+            let word = self.s.m.bin(c, Bin::LShr, n, k5);
+            let word = self.s.m.bin(c, Bin::Shl, word, k2);
+            let bit = self.s.m.bin(c, Bin::And, n, k31);
+            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            // Most writes find their page marked: a load, not an atomic.
+            let old = self.raw_dword(bitmap, word);
+            let c = self.cur;
+            let set = self.s.m.bin(c, Bin::And, old, bit);
+            let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
+            if i == 1 {
+                let other = self.s.m.cmp(c, pred::NE, n, bits[0]);
+                clear = self.s.m.bin(c, Bin::And, clear, other);
+            }
+            let inner = self.begin_guarded(Some(clear));
+            let iu = self.s.m.undef(self.s.t.i32);
+            let i32t = self.s.t.i32;
+            // Operation 2 is OR.
+            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[bitmap, k2, word, iu, iu, bit]);
+            self.end_guarded(inner, &[]);
+        }
+    }
+
+    /// Write marks for a store or atomic of `bytes` bytes at the title
+    /// address `lo`/`hi` (title memory by address): the page bits come from
+    /// the address itself, as a view's table entry would give them.
+    fn mark_address(&mut self, lo: V, hi: V, bytes: u32) {
+        use super::shader::{SLOT_MARKS, VIEW_WRITE_BITS};
+        if !view_marks() {
+            return;
+        }
+        self.s.marked = true;
+        let bitmap = self.s.root_uav_handle(SLOT_MARKS);
+        if !matches!(self.x.native.stage, HwStage::Cs | HwStage::Ps) {
+            self.s.flags |= super::shader::flags::UAVS_AT_EVERY_STAGE;
+        }
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k16, mask) = (k(self, 16), k(self, VIEW_WRITE_BITS - 1));
+        let span = k(self, bytes.max(1) - 1);
+        let last = self.s.m.bin(c, Bin::Add, lo, span);
+        let high = self.s.m.bin(c, Bin::Shl, hi, k16);
+        let mut bits = [lo, lo];
+        for (i, byte) in [lo, last].into_iter().enumerate() {
+            let page = self.s.m.bin(c, Bin::LShr, byte, k16);
+            let n = self.s.m.bin(c, Bin::Or, page, high);
+            bits[i] = self.s.m.bin(c, Bin::And, n, mask);
+        }
+        self.set_mark_bits(bitmap, bits);
+    }
+
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
         let g = guard?;
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
@@ -5654,6 +5875,18 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
+        // A descriptor nothing uses as one, whose size the code reads all the same (a
+        // texture picked from the heap by an index in a constant buffer, its width and
+        // height turned into a texel size; a buffer tested for being empty by its record
+        // count): the kind from its dwords and its used-resource entry.
+        let unused = if use_at.is_none() {
+            self.unused_descriptor_kind(inst, site, code, count)
+        } else {
+            None
+        };
+        let (first, props, image, uav, used) = if let Some(kind) = unused {
+            kind
+        } else {
         let Some((at, first)) = use_at else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
@@ -5767,6 +6000,9 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        (first, props, image, uav, used)
+        };
+        let src = Source::Loaded { load: site, first };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -5834,8 +6070,10 @@ impl<'a> Lower<'a> {
                     inst.write(Reg::S(code + first + k))
                         .is_some_and(|v| self.computed_with(v, 6))
                 });
+                // (A descriptor nothing uses as one gets it whenever the host can tell it, as
+                // a buffer whose address alone is read does.)
                 if first == 0
-                    && computed
+                    && (computed || unused.is_some())
                     && let Some((lo, hi)) = self.view_address(site)
                 {
                     words.extend([(0, lo), (1, hi)]);
@@ -5856,6 +6094,67 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// What [`Self::descriptor_data`] makes of a descriptor load that nothing uses as a
+    /// descriptor but whose dwords the code reads: the first dword, the handle properties,
+    /// the image kind (none for a buffer), whether it is an unordered view, and its
+    /// used-resource entry. An image's eight dwords read as a 2D texture's, a buffer's four
+    /// as a raw view's where the code reads its record count (dword 2); none for anything
+    /// else (a constant buffer, a sampler, a buffer whose address alone is read).
+    // shortcut: an image whose kind nothing tells is taken for a 2D texture (the title's
+    // reads are texel sizes of 2D textures: puddle masks, shadow masks); a host view of
+    // another kind would answer its own sizes.
+    #[allow(clippy::type_complexity)]
+    fn unused_descriptor_kind(
+        &self,
+        inst: &Inst,
+        site: Site,
+        code: u8,
+        count: u32,
+    ) -> Option<(u8, (u32, u32), Option<u32>, bool, Option<&'a UsedResource>)> {
+        // Kept per lane and compared (`Resources::lane_copied`), or a sampler's: the cases
+        // `descriptor_data` handles on their own.
+        if self.x.res.lane_copied.contains(&site)
+            || self.x.res.descriptors.iter().any(|d| {
+                d.role == Role::Sampler
+                    && d.source.leaves().into_iter().any(
+                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
+                    )
+            })
+        {
+            return None;
+        }
+        let used = self.used_kind(&Source::Loaded {
+            load: site,
+            first: 0,
+        });
+        if used.is_some_and(|u| !matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+            return None;
+        }
+        let read = |k: u32| {
+            inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
+                self.x
+                    .p
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| i.reads.iter().any(|r| r.1 == v))
+            })
+        };
+        let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let u = if uav { 0x1000 } else { 0 };
+        match count {
+            // width (dwords 1-2), height (2), levels (3), depth (4)
+            8 if (1..5).any(read) && used.is_none_or(|u| u.dwords == 8) => {
+                Some((0, (2 | u, 0x409), Some(2), uav, used))
+            }
+            // the record count
+            4 if read(2) && used.is_none_or(|u| u.dwords == 4) => {
+                Some((0, (11 | u, 0), None, uav, used))
+            }
+            _ => None,
+        }
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -7347,6 +7646,45 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_cvt_f32_f64" => {
+                // An f64 inline constant (1.0, 0.5...) is another encoding: not taken.
+                if matches!(v.src.first(), Some(Operand::Const(240..=255))) {
+                    return Err("an f64 inline constant");
+                }
+                let x = self.src64(inst, 0)?;
+                let (lo, hi) = self.split64(x);
+                let r = self.f64_bits_to_f32(lo, hi);
+                int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Lane i of each 16-lane row takes src0 from lane nibble i of
+                // {src2, src1} of its own row (v_permlane16) or of the other
+                // row of its 32 lanes (v_permlanex16). It never leaves its 32
+                // lanes: a console wave64 split in host waves of 32 keeps it.
+                // shortcut: the fi and bound_ctrl bits (reads of lanes that do
+                // not run) are not followed: such a lane is read as it is.
+                self.s.flags |= flags::WAVE_OPS;
+                let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let c = self.cur;
+                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                let lane = self.lane_index();
+                let (k15, k16, k7, k8, k4, k31) = (k(self, 15), k(self, 16), k(self, 7), k(self, 8), k(self, 4), k(self, 31));
+                let low = self.s.m.bin(c, Bin::And, lane, k15);
+                let row = self.s.m.bin(c, Bin::And, lane, k16);
+                let row = if name == "v_permlanex16_b32" { self.s.m.bin(c, Bin::Xor, row, k16) } else { row };
+                let base = self.s.m.bin(c, Bin::And, lane, k31);
+                let base = self.s.m.bin(c, Bin::Xor, lane, base);
+                let high = self.s.m.cmp(c, pred::IUGE, low, k8);
+                let sel = self.s.m.select(c, high, s2, s1);
+                let nib = self.s.m.bin(c, Bin::And, low, k7);
+                let shift = self.s.m.bin(c, Bin::Mul, nib, k4);
+                let pick = self.s.m.bin(c, Bin::LShr, sel, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let from = self.s.m.bin(c, Bin::Or, base, row);
+                let from = self.s.m.bin(c, Bin::Or, from, pick);
+                let r = self.read_lane(a, from);
+                int(self, r)
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -7515,6 +7853,68 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// The f32 bits of the f64 whose bits are `lo`/`hi`, rounded to nearest
+    /// even, in integer operations (the translation has no f64 type): NaN
+    /// stays NaN, out of range becomes infinity, too small (f32 denormals
+    /// included) becomes zero, as the console's flushing mode does.
+    fn f64_bits_to_f32(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let sign = { let m = k(self, 0x8000_0000); self.s.m.bin(c, Bin::And, hi, m) };
+        let exp = {
+            let (k20, m) = (k(self, 20), k(self, 0x7FF));
+            let e = self.s.m.bin(c, Bin::LShr, hi, k20);
+            self.s.m.bin(c, Bin::And, e, m)
+        };
+        let manthi = { let m = k(self, 0xF_FFFF); self.s.m.bin(c, Bin::And, hi, m) };
+        let (k3, k29, k23) = (k(self, 3), k(self, 29), k(self, 23));
+        let m23 = {
+            let a = self.s.m.bin(c, Bin::Shl, manthi, k3);
+            let b = self.s.m.bin(c, Bin::LShr, lo, k29);
+            self.s.m.bin(c, Bin::Or, a, b)
+        };
+        let rest = { let m = k(self, 0x1FFF_FFFF); self.s.m.bin(c, Bin::And, lo, m) };
+        let e = { let b = k(self, 896); self.s.m.bin(c, Bin::Sub, exp, b) };
+        let normal = {
+            let es = self.s.m.bin(c, Bin::Shl, e, k23);
+            let x = self.s.m.bin(c, Bin::Or, sign, es);
+            let x = self.s.m.bin(c, Bin::Or, x, m23);
+            let half = k(self, 0x1000_0000);
+            let over = self.s.m.cmp(c, pred::IUGT, rest, half);
+            let tie = self.s.m.cmp(c, pred::EQ, rest, half);
+            let one = k(self, 1);
+            let odd = self.s.m.bin(c, Bin::And, m23, one);
+            let kk = k(self, 0);
+
+            let odd = self.s.m.cmp(c, pred::NE, odd, kk);
+            let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+            let up = self.s.m.bin(c, Bin::Or, over, tie_up);
+            let zero = k(self, 0);
+            let add = self.s.m.select(c, up, one, zero);
+            // a carry out of the mantissa raises the exponent, as it should
+            self.s.m.bin(c, Bin::Add, x, add)
+        };
+        let inf = { let i = k(self, 0x7F80_0000); self.s.m.bin(c, Bin::Or, sign, i) };
+        let nan = { let n = k(self, 0x7FC0_0000); self.s.m.bin(c, Bin::Or, sign, n) };
+        let any = self.s.m.bin(c, Bin::Or, manthi, lo);
+        let kk = k(self, 0);
+
+        let is_nan_mant = self.s.m.cmp(c, pred::NE, any, kk);
+        let special = self.s.m.select(c, is_nan_mant, nan, inf);
+        let kk = k(self, 0x7FF);
+
+        let is_special = self.s.m.cmp(c, pred::EQ, exp, kk);
+        let kk = k(self, 255);
+
+        let too_big = self.s.m.cmp(c, pred::SGE, e, kk);
+        let kk = k(self, 0);
+
+        let too_small = self.s.m.cmp(c, pred::SLE, e, kk);
+        let r = self.s.m.select(c, too_small, sign, normal);
+        let r = self.s.m.select(c, too_big, inf, r);
+        self.s.m.select(c, is_special, special, r)
     }
 
     fn join64(&mut self, lo: V, hi: V) -> V {
@@ -8701,7 +9101,8 @@ impl<'a> Lower<'a> {
             // took over reads as zero instead of stopping whatever reads it, so
             // that the program (the deferred shaders of walls and floors, two
             // of them) translates and its draws are not dropped.
-            if interp_zero() {
+            let name = inst.name();
+            if interp_zero() || name == "v_interp_p1_f32" || name == "v_interp_p1ll_f16" {
                 let dst = match &inst.fields {
                     Fields::Vintrp { dst, .. } => Some(*dst),
                     Fields::Valu(v) => v.dst,
@@ -9077,6 +9478,11 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
+        // Write marks: an image store or atomic may write a texture placed in
+        // a buffer's memory, which the marks do not see: not relied on.
+        if view_marks() && (store || name.starts_with("image_atomic")) {
+            self.s.unmarked = true;
+        }
         let uav = store
             || self
                 .used_kind(src)
@@ -10036,6 +10442,7 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
             }
+            self.mark_view_write(h, aligned, 8);
             if bits == 16 {
                 let second = self.begin_guarded(Some(straddles));
                 for (op, x) in [(and, keep_next), (or, set_next)] {
@@ -10097,6 +10504,16 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
+            let byte = match index {
+                Some(index) if used.is_some_and(|u| u.stride == 1) => self.s.m.bin(self.cur, Bin::Add, index, off),
+                Some(index) => {
+                    let s = self.s.m.i32(used.map_or(0, |u| u.stride));
+                    let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                    self.s.m.bin(self.cur, Bin::Add, row, off)
+                }
+                None => off,
+            };
+            self.mark_view_write(h, byte, 4);
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
@@ -10170,6 +10587,24 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            if typed {
+                // Write marks: a typed store's element size is not known here.
+                if view_marks() {
+                    self.s.unmarked = true;
+                }
+            } else {
+                // The byte the store starts at in the view: args[1] for a raw
+                // view, element * stride + offset for a structured one.
+                let byte = match index {
+                    Some(index) if !used.is_some_and(|u| u.stride == 1) => {
+                        let s = self.s.m.i32(used.map_or(0, |u| u.stride));
+                        let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                        self.s.m.bin(self.cur, Bin::Add, row, off)
+                    }
+                    _ => args[1],
+                };
+                self.mark_view_write(args[0], byte, 4 * u32::from(count));
+            }
             self.end_guarded(at, &[]);
             return Ok(());
         }

@@ -765,7 +765,7 @@ fn check(
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
             if t.list {
-                t.lines.push(format!("{}  validated", label()));
+                t.lines.push(format!("{}  validated marks={}", label(), shader.marks));
             }
         }
         Err(text) => {

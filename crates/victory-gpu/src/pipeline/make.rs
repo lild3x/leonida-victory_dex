@@ -154,6 +154,15 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
+/// shortcut: `VICTORY_PIPELINE_WAIT_ALL=1`: a draw always waits for its host
+/// pipeline (no budget, no "slow" exception) instead of being dropped, so
+/// nothing shows up invisible while the driver compiles; the frame stalls
+/// instead the first time something new is drawn.
+fn wait_all() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ALL").is_some_and(|v| v == "1"))
+}
+
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
@@ -162,6 +171,8 @@ fn wait_budget() -> Duration {
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(500);
+        // `VICTORY_PIPELINE_WAIT_ALL=1`: no budget (an hour a frame).
+        let millis = if wait_all() { 3_600_000 } else { millis };
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })
@@ -170,6 +181,10 @@ fn wait_budget() -> Duration {
 /// Whether the host's driver has been at `p` for longer than most take
 /// (one of the title's takes 85 s): no frame waits for it.
 fn slow(p: &Pending) -> bool {
+    // `VICTORY_PIPELINE_WAIT_ALL=1`: every draw waits for its pipeline.
+    if wait_all() {
+        return false;
+    }
     // A pass a title runs once (it unpacks a model, say) is lost if its
     // pipeline is not there; a draw comes again in the next frame.
     let most = if p.computes() { 10 } else { 3 };

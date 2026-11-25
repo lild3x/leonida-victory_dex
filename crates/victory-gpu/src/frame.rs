@@ -53,7 +53,16 @@ pub(crate) extern "system" fn set_interval(
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    // shortcut: `VICTORY_FRAME_US=<microseconds>` replaces the interval the
+    // title asks for (its menus pace themselves to 30 Hz): 16667 for 60 fps,
+    // 8333 for 120. Only where the title runs faster than it asks.
+    let asked = interval;
+    let interval = std::env::var("VICTORY_FRAME_US")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&us| us > 0)
+        .map_or(interval, Duration::from_micros);
+    tracing::info!(?interval, ?asked, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()

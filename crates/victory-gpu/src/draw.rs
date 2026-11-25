@@ -714,6 +714,20 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        if kind == victory_shader::emit::USER_VIEW_MARK || kind == victory_shader::emit::USER_VIEW_MARK + 1 {
+            // Write marks: the entry of the raw view bound for this root view,
+            // from the 16 bytes below the address as `USER_VIEW_BIAS` says.
+            let entry = match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(crate::marks::NONE, |s| {
+                    // SAFETY: a live buffer.
+                    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                    let bias = (s.gpu(address) - base) & 15;
+                    crate::marks::entry(address - bias)
+                }),
+                _ => crate::marks::NONE,
+            };
+            return entry[usize::from(kind != victory_shader::emit::USER_VIEW_MARK)];
+        }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
             // (`root_uav`, `root_srv_table`).
@@ -929,6 +943,9 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            // marks 0: the program writes no buffer (nothing it declares changes by it)
+            crate::marks::set_binding(t.host.marks != 2);
+            crate::marks::set_writer(&stage.shader.hash, t.host.marks);
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
@@ -940,6 +957,10 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            // Write marks: a program that stores without marking every write.
+            if t.stores && t.host.marks == 2 {
+                list.note_unmarked();
+            }
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
@@ -989,6 +1010,21 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
                             }
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_MARKS {
+                        // Ours: the write-mark entry of each view heap slot.
+                        match self.heap_marks(list) {
+                            // SAFETY: an open list; the list keeps the table.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("write marks: a shader marks writes but the view heap has no mark table"),
                         }
                         continue;
                     }
@@ -1055,6 +1091,21 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_MARKS {
+                    // Ours: the bitmap of written pages (CPU-visible, kept for the run).
+                    match crate::host::host().and_then(crate::marks::bitmap_gpu) {
+                        // SAFETY: an open list; the bitmap lives as long as the process.
+                        Some(gpu) => unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                            }
+                        },
+                        None => once!("write marks: no bitmap"),
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -1298,6 +1349,25 @@ impl State {
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
+    /// Write marks: the per-slot table of the bound view heap, kept by the list.
+    fn heap_marks(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.marks_gpu()?;
+        const ONCE: usize = usize::MAX - 0x6d;
+        if list.first_use(ONCE)
+            && let Some(buffer) = host.marks_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
         let heap = self
             .heaps
@@ -1506,7 +1576,7 @@ impl State {
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
         host.texture_sweep(heap, frame);
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let (due, census) = host.texture_slots_due(frame, texture_knob("VICTORY_TEXTURE_SLOTS").map_or(4096, |n| n as usize));
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1543,6 +1613,11 @@ impl State {
         } else {
             (PER_FRAME, SPAN)
         };
+        // shortcut: `VICTORY_TEXTURE_MB` / `VICTORY_TEXTURE_MS` replace both
+        // budgets (bytes staged per frame, time per pass): textures come in
+        // sooner at the cost of slower frames while they do.
+        let per_frame = texture_knob("VICTORY_TEXTURE_MB").map_or(per_frame, |mb| mb << 20);
+        let span = texture_knob("VICTORY_TEXTURE_MS").map_or(span, std::time::Duration::from_millis);
         let began = std::time::Instant::now();
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
@@ -1823,6 +1898,9 @@ impl State {
             .flatten();
         for stage in &p.stages {
             let t = stage.translated();
+            // marks 0: the program writes no buffer (nothing it declares changes by it)
+            crate::marks::set_binding(t.host.marks != 2);
+            crate::marks::set_writer(&stage.shader.hash, t.host.marks);
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
                 let v = match u.root {
@@ -2162,6 +2240,9 @@ impl State {
         let mut out = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
+            // marks 0: the program writes no buffer (nothing it declares changes by it)
+            crate::marks::set_binding(t.host.marks != 2);
+            crate::marks::set_writer(&stage.shader.hash, t.host.marks);
             for u in &t.used {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
@@ -2799,4 +2880,19 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// A texture budget override (`VICTORY_TEXTURE_MB`, `_MS`, `_SLOTS`), read once.
+fn texture_knob(name: &'static str) -> Option<u64> {
+    static KNOBS: std::sync::Mutex<Vec<(&'static str, Option<u64>)>> = std::sync::Mutex::new(Vec::new());
+    let mut knobs = KNOBS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, v)) = knobs.iter().find(|k| k.0 == name) {
+        return v;
+    }
+    let v = std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n > 0);
+    if let Some(n) = v {
+        tracing::info!(name, n, "texture budget override");
+    }
+    knobs.push((name, v));
+    v
 }

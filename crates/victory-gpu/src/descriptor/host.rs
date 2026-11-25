@@ -58,6 +58,10 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// Write marks (`crate::marks`): per slot, the page bit and phase of the
+    /// buffer view it holds (two dwords), `marks::NONE` for none: an upload
+    /// buffer of `SLOT_STRIDES_COUNT` entries, its GPU address and mapping.
+    marks: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -691,7 +695,22 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let marks = (!sampler && crate::marks::on())
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer. All 0xFF:
+                // every slot starts with no entry (VIEW_MARK_NONE).
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0xFF, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "write marks by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
+            marks,
             heap,
             cpu,
             step,
@@ -1263,6 +1282,7 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
+        self.set_mark(index, view);
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
@@ -1306,7 +1326,27 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
+    /// Write marks: slot `index`'s entry, from the buffer view it now holds
+    /// (`marks::NONE` for none).
+    fn set_mark(&self, index: u32, view: Option<&View>) {
+        if let Some((_, _, data)) = &self.marks
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let entry = view
+                .and_then(buffer_range)
+                .map_or(crate::marks::NONE, |(address, _)| crate::marks::entry(address));
+            // SAFETY: inside the mapping; shaders read it while we write
+            // (each dword is one the slot had or has).
+            unsafe {
+                let at = (*data as *mut u32).add(2 * index as usize);
+                at.write_volatile(entry[0]);
+                at.add(1).write_volatile(entry[1]);
+            }
+        }
+    }
+
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        self.set_mark(index, Some(view));
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
@@ -1316,6 +1356,7 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.set_mark(index, None);
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -1442,6 +1483,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        self.set_mark(index, None);
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -1465,6 +1507,16 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// Write marks: the GPU address of the per-slot table, if marks are on.
+    pub(crate) fn marks_gpu(&self) -> Option<u64> {
+        self.marks.as_ref().map(|m| m.1)
+    }
+
+    /// Write marks: the per-slot table (lists that bind it keep it).
+    pub(crate) fn marks_buffer(&self) -> Option<&ID3D12Resource> {
+        self.marks.as_ref().map(|m| &m.0)
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the

@@ -1619,6 +1619,8 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Write marks: a program that does not mark every write writes this copy.
+    Unmarked(std::sync::Arc<crate::shadow::Shadow>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1650,6 +1652,9 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Write marks: a program that stores without marking every write was
+    /// bound in this list (`crate::marks::unmarked_writer` at submission).
+    unmarked: bool,
 }
 
 impl Deferred {
@@ -2127,7 +2132,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::Unmarked(_) => {}
             }
         }
     }
@@ -2488,7 +2493,19 @@ fn relay_hand_back(back: &[Declared]) {
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
         for (at, n) in found {
-            written += shadow.relay_merge(at, n, &mut now, &mut title);
+            let w = shadow.relay_merge(at, n, &mut now, &mut title);
+            // Write marks, stage 2: a piece the old compare found written
+            // must lie on a marked page (`marks::CHECKED[1]` stays 0).
+            if w > 0 && crate::marks::on() {
+                let from = shadow.title_start() + at as u64;
+                let last = from + n.max(1) as u64 - 1;
+                let ok = crate::marks::marked(from) || crate::marks::marked(last);
+                crate::marks::check_written(from, ok, shadow.marks_reliable());
+                if !ok && shadow.marks_reliable() {
+                    crate::marks::explain_miss(shadow.title_start(), shadow.len_bytes(), from, n as u64, shadow.last_writer());
+                }
+            }
+            written += w;
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -3807,6 +3824,9 @@ impl Host {
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
             relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            // Nothing in the air nor landing, under the submission lock: no
+            // shader can be marking, every mark has been used.
+            crate::marks::clear();
             return;
         }
         let was_working = working(true);
@@ -3973,14 +3993,22 @@ impl Host {
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
+            // Write marks: nothing in the air, every mark has been used.
+            crate::marks::clear();
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
+            crate::marks::clear();
         }
         let behind = late && flying();
+        // Write marks: lists that bind a program storing unmarked make the
+        // marks unreliable until the next clear (after this one, if any).
+        if runs.iter().any(|l| l.deferred().unmarked) {
+            crate::marks::unmarked_writer();
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -4940,6 +4968,11 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Write marks: a program that stores unmarked is bound in this list.
+    pub(crate) fn note_unmarked(&self) {
+        self.deferred().unmarked = true;
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
@@ -4990,6 +5023,12 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Write marks: at submission, `shadow`'s marks stop being relied on
+    /// until the next clear.
+    pub(crate) fn defer_unmarked(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        self.deferred().copies.push(Step::Unmarked(shadow.clone()));
+    }
+
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -5211,6 +5250,10 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
+                    continue;
+                }
+                Step::Unmarked(shadow) => {
+                    shadow.note_unmarked();
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
@@ -5767,6 +5810,9 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        if let Some(line) = crate::marks::line() {
+            tracing::info!("{line}");
+        }
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {

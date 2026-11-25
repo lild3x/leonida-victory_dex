@@ -85,6 +85,8 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_RT_STUB",
             "VICTORY_POPS_SKIP",
             "VICTORY_INTERP_ZERO",
+            // write marks (fx-marks): programs translated with them are other programs
+            "VICTORY_VIEW_MARKS",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");
@@ -260,6 +262,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, u32::from(s.marks));
     out
 }
 
@@ -328,6 +331,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    // Write marks: absent in entries written before they existed.
+    let marks = if r.0.len() >= 4 { u8::try_from(r.word()?).ok()? } else { 0 };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -338,6 +343,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        marks,
     })
 }
 
@@ -372,6 +378,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            marks: 1,
         }
     }
 

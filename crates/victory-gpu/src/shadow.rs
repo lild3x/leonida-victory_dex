@@ -77,6 +77,12 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Write marks: the clear epoch in which a program that does not mark
+    /// every write wrote this copy (`u64::MAX`: none). Its marks are not
+    /// relied on until the bitmap is cleared again.
+    unmarked_epoch: AtomicU64,
+    /// Diagnostics: the last program that declared writes here (hash, marks).
+    last_writer: std::sync::Mutex<(u64, u8)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1720,6 +1726,8 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            unmarked_epoch: AtomicU64::new(u64::MAX),
+            last_writer: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -1739,6 +1747,21 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
+    /// Write marks: a program that does not mark every write writes this
+    /// copy in the submission being prepared (`crate::marks::epoch`).
+    pub(crate) fn note_unmarked(&self) {
+        self.unmarked_epoch.store(crate::marks::epoch(), Ordering::Relaxed);
+    }
+
+    /// Write marks: whether this copy's marks can be relied on now.
+    pub(crate) fn last_writer(&self) -> (u64, u8) {
+        *self.last_writer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn marks_reliable(&self) -> bool {
+        self.unmarked_epoch.load(Ordering::Relaxed) != crate::marks::epoch()
+    }
+
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
@@ -1749,7 +1772,13 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        *self.last_writer.lock().unwrap_or_else(|e| e.into_inner()) = crate::marks::writer();
         list.defer_gpu_write(self, address as usize, len as usize);
+        // Write marks: a program that does not mark every write (the one
+        // bound now on this thread, or a root view's, or by address).
+        if crate::marks::on() && !crate::marks::binding_marked() {
+            list.defer_unmarked(self);
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -1999,6 +2028,16 @@ impl Shadow {
     /// and puts the title's bytes into the copy and the snapshot: the two
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
+    /// The title address the copy starts at (write marks' check).
+    pub(crate) fn title_start(&self) -> u64 {
+        self.start
+    }
+
+    /// The title bytes the copy holds (write marks' check).
+    pub(crate) fn len_bytes(&self) -> u64 {
+        self.len
+    }
+
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {

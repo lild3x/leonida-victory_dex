@@ -47,6 +47,21 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// Write marks (ours, `VICTORY_VIEW_MARKS=1`): the root SRV `t<SLOT_MARKS>`
+/// in [`ROOT_CBV_SPACE`] is a table of two dwords per view-heap index, the
+/// first page bit of the view and its phase (the view's first byte within
+/// that 64 KiB page); the root UAV `u<SLOT_MARKS>` is a bitmap of
+/// [`VIEW_WRITE_BITS`] bits, one per 64 KiB page of the title memory the host
+/// keeps copies of. A store or atomic through a buffer view sets the bits of
+/// the pages it touches, so the host compares only those after a submission.
+pub const SLOT_MARKS: u8 = 252;
+/// A table entry of a view that has none: its writes mark the sentinel bit
+/// (bit [`VIEW_WRITE_BITS`], past the page bits), which tells the host to
+/// compare everything. The bitmap holds `VIEW_WRITE_BITS + 32` bits.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits of the written-pages bitmap: bit = title page number (address >> 16)
+/// modulo this. A table entry's base is that bit for the view's first byte.
+pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -75,10 +90,17 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// parts, each with the groups before it here. Asked for by compute programs
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: write
+/// marks' page bit of the raw view the host binds for the root view of root
+/// parameter `slot` (its first byte, `USER_VIEW_BIAS` included);
+/// [`USER_VIEW_MARK`] + 1: that byte's offset in its 64 KiB page.
+pub const USER_VIEW_MARK: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// UAVs in a stage other than compute and pixel (write marks' bitmap).
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -162,6 +184,11 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Write marks: the heap index of each unordered buffer view's handle.
+    pub view_index: std::collections::HashMap<V, V>,
+    /// Write marks: some write was marked / some buffer write could not be.
+    pub marked: bool,
+    pub unmarked: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -218,6 +245,9 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            view_index: std::collections::HashMap::new(),
+            marked: false,
+            unmarked: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -445,7 +475,12 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        // Write marks: an unordered typed, raw or structured buffer (kinds 10-12).
+        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+            self.view_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.
@@ -783,6 +818,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
