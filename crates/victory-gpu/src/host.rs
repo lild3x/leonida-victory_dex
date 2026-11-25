@@ -204,13 +204,48 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// Background reaper thread that drops finished D3D12 allocations off the
+/// critical `victory-late-wait` and `victory-submit` paths (`DestroyAllocation2`
+/// / `FreeGpuVirtualAddress` otherwise cost 13-18 ms/frame on those threads).
+fn reap(item: Retired) {
+    use std::sync::{Arc, Condvar};
+    static QUEUE: OnceLock<Arc<(Mutex<Vec<Retired>>, Condvar)>> = OnceLock::new();
+    let q = QUEUE.get_or_init(|| {
+        let pair = Arc::new((Mutex::new(Vec::<Retired>::new()), Condvar::new()));
+        let bg = Arc::clone(&pair);
+        let _ = std::thread::Builder::new()
+            .name("victory-reaper".into())
+            .spawn(move || {
+                let (lock, wake) = &*bg;
+                loop {
+                    let batch = {
+                        let mut items = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while items.is_empty() {
+                            items = wake.wait(items).unwrap_or_else(|e| e.into_inner());
+                        }
+                        std::mem::take(&mut *items)
+                    };
+                    drop(batch);
+                }
+            });
+        pair
+    });
+    let (lock, wake) = &**q;
+    lock.lock().unwrap_or_else(|e| e.into_inner()).push(item);
+    wake.notify_one();
+}
+
+/// Drops `object` once every submission running now has finished: offloaded
+/// to the background reaper if none is running (except in unit tests).
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        if cfg!(test) {
+            drop(object);
+        } else {
+            reap(Retired(Box::new(object)));
+        }
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -233,7 +268,13 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    if !done.is_empty() {
+        if cfg!(test) {
+            drop(done);
+        } else {
+            reap(Retired(Box::new(done)));
+        }
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -887,9 +928,11 @@ pub(crate) struct HostList {
     /// clamp uses instead when there is one: zeroed in the list before its
     /// first clamp, its notes copied to `budget` when the list closes.
     card_budget: OnceLock<Option<ID3D12Resource>>,
-    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Ring pools of device-local scratch buffers for clamped indirect arguments
+    /// (`indirect`): 4 unwindowed slots cycled per clamp so back-to-back indirect
+    /// draws can overlap on the GPU without aliasing offset 0, plus 4 isolated
+    /// window slots so unwindowed draws never clobber cached indirect windows.
+    indirect_args: Mutex<IndirectScratchPool>,
     /// The buffers of `crate::indirect::window_check`, made at its first use.
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -911,6 +954,17 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// Scratch buffers for indirect argument clamping: one reusable unwindowed
+/// buffer (preserving low VRAM footprint across hundreds of lists) plus a
+/// 2-slot isolated windowed ring so unwindowed draws never clobber cached
+/// indirect windows.
+#[derive(Default)]
+struct IndirectScratchPool {
+    unwindowed: Option<(ID3D12Resource, u64)>,
+    windowed: [Option<(ID3D12Resource, u64)>; 2],
+    next_windowed: usize,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2061,11 +2115,17 @@ struct Deferred {
     /// Write marks: a program that stores without marking every write was
     /// bound in this list (`crate::marks::unmarked_writer` at submission).
     unmarked: bool,
-    /// The indirect scratch buffer (`HostList::indirect_args`, by its
-    /// interface pointer) that a clamp in this recording left readable as
-    /// indirect arguments; 0 if none. It stays readable until the next
-    /// clamp into it ([`HostList::indirect_state`]).
-    indirect_readable: usize,
+    /// The indirect scratch buffers (`HostList::indirect_args`, by their
+    /// interface pointers) that clamps in this recording left readable as
+    /// indirect arguments. Each stays readable until the next clamp into that
+    /// buffer ([`HostList::indirect_state`]) or list close.
+    indirect_readable: Vec<usize>,
+    /// Whether a global UAV barrier has ordered all earlier UAV writes on this
+    /// list with no subsequent UAV-writing shader yet.
+    uav_clean_all: bool,
+    /// Resource pointers already ordered by a targeted UAV barrier since the
+    /// last UAV-writing shader on this list.
+    uav_clean_srcs: Vec<usize>,
 }
 
 impl Deferred {
@@ -3648,6 +3708,15 @@ fn late_line(frames: f64) {
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
+        );
+    }
+    if crate::shadow::refresh_compare() {
+        let [read, taken, runs] = crate::shadow::compared_stats().map(|n| n as f64 / frames);
+        tracing::info!(
+            "refreshes that compare per frame (VICTORY_REFRESH_COMPARE=1): {:.1} MB of pages written since their last \
+             copy read, {:.1} MB of them differed from the copy and were taken, in {runs:.0} runs",
+            read / (1 << 20) as f64,
+            taken / (1 << 20) as f64
         );
     }
 }
@@ -6225,10 +6294,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         self.textures_back();
-        let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some((scratch, _)) = scratch {
-            self.indirect_common(&scratch);
-        }
+        self.indirect_all_common();
         self.card_budget_out();
         // The scratch buffers its prelude fills and leaves readable as
         // arguments: common again behind the list, as every scratch buffer.
@@ -6271,7 +6337,16 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        let old_deferred = std::mem::take(&mut *self.deferred());
+        if !cfg!(test)
+            && (!old_deferred.uploads.is_empty()
+                || !old_deferred.kept.is_empty()
+                || !old_deferred.backs.is_empty())
+        {
+            reap(Retired(Box::new(old_deferred)));
+        } else {
+            drop(old_deferred);
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7084,17 +7159,17 @@ impl HostList {
         }
     }
 
-    /// A device-local unordered-access buffer of at least `size` bytes for
-    /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    /// Ensures `slot` holds a device-local UAV buffer of at least `size` bytes,
+    /// returning it and any smaller replaced buffer to transition & keep alive.
+    fn take_indirect_slot(
+        slot: &mut Option<(ID3D12Resource, u64)>,
+        size: u64,
+    ) -> Option<(ID3D12Resource, Option<ID3D12Resource>)> {
         let needed = size.max(64 << 10);
-        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((buffer, cap)) = &*slot
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            return Some((buffer.clone(), None));
         }
         let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
         let alloc = prev
@@ -7103,29 +7178,93 @@ impl HostList {
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
-        drop(slot);
-        if let Some((old_buf, _)) = old {
-            // It ends the list common, as every scratch buffer does.
+        let old = slot.replace((buffer.clone(), alloc)).map(|(b, _)| b);
+        Some((buffer, old))
+    }
+
+    /// Reusable scratch buffer for unwindowed clamps (`indirect::bound`).
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+        let (buffer, old) = {
+            let mut pool = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            Self::take_indirect_slot(&mut pool.unwindowed, size)?
+        };
+        if let Some(old_buf) = old {
             self.indirect_common(&old_buf);
             self.keep(&old_buf);
         }
         Some(buffer)
     }
 
+    /// Next scratch buffer from the 2-slot windowed ring (`indirect::bound_window`).
+    /// Isolated from `indirect_scratch` so unwindowed draws never clobber live
+    /// cached indirect windows.
+    pub(crate) fn indirect_window_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+        let (buffer, old) = {
+            let mut pool = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            let idx = pool.next_windowed;
+            pool.next_windowed = (idx + 1) & 1;
+            Self::take_indirect_slot(&mut pool.windowed[idx], size)?
+        };
+        if let Some(old_buf) = old {
+            self.indirect_common(&old_buf);
+            self.keep(&old_buf);
+        }
+        Some(buffer)
+    }
+
+    /// Resets the windowed scratch ring index when a state clears its 2-entry
+    /// FIFO window cache on a fresh list recording.
+    pub(crate) fn reset_indirect_window_ring(&self) {
+        self.indirect_args
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_windowed = 0;
+    }
+
+    /// Moves all indirect scratch buffers left in `INDIRECT_ARGUMENT` back to
+    /// `COMMON` in a single batched `ResourceBarrier` before list close.
+    fn indirect_all_common(&self) {
+        let readable = std::mem::take(&mut self.deferred().indirect_readable);
+        if readable.is_empty() {
+            return;
+        }
+        let bufs: Vec<ID3D12Resource> = {
+            let pool = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            pool.unwindowed
+                .iter()
+                .chain(pool.windowed.iter().flatten())
+                .map(|(b, _)| b)
+                .filter(|b| readable.contains(&(b.as_raw() as usize)))
+                .cloned()
+                .collect()
+        };
+        if bufs.is_empty() {
+            return;
+        }
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = bufs
+            .iter()
+            .map(|b| {
+                transition(
+                    b,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )
+            })
+            .collect();
+        // SAFETY: an open list and live buffers left in `INDIRECT_ARGUMENT`.
+        unsafe { self.list.ResourceBarrier(&barriers) };
+    }
+
     /// Moves `scratch` back to the common state if a clamp left it readable
-    /// as indirect arguments ([`HostList::indirect_readable`]): where the
-    /// list's first clamp expects it. Done before the list closes and before
-    /// a bigger scratch buffer replaces it: one barrier per list (where
-    /// there was one per indirect execution), and the list ends as it
-    /// begins however it is submitted.
+    /// as indirect arguments ([`HostList::indirect_readable`]).
     fn indirect_common(&self, scratch: &ID3D12Resource) {
+        let ptr = scratch.as_raw() as usize;
         {
             let mut deferred = self.deferred();
-            if deferred.indirect_readable != scratch.as_raw() as usize {
+            let Some(pos) = deferred.indirect_readable.iter().position(|&p| p == ptr) else {
                 return;
-            }
-            deferred.indirect_readable = 0;
+            };
+            deferred.indirect_readable.swap_remove(pos);
         }
         let barrier = transition(
             scratch,
@@ -7138,12 +7277,10 @@ impl HostList {
     }
 
     /// The state the list's indirect scratch buffer `scratch` is in at this
-    /// point of the recording: indirect arguments if a clamp in this
-    /// recording left it so ([`HostList::indirect_readable`]), otherwise
-    /// common: the state a buffer is made in, and the one a recording
-    /// leaves it in when it closes or replaces it ([`HostList::indirect_common`]).
+    /// point of the recording.
     pub(crate) fn indirect_state(&self, scratch: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
-        if self.deferred().indirect_readable == scratch.as_raw() as usize {
+        let ptr = scratch.as_raw() as usize;
+        if self.deferred().indirect_readable.contains(&ptr) {
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
         } else {
             D3D12_RESOURCE_STATE_COMMON
@@ -7151,10 +7288,46 @@ impl HostList {
     }
 
     /// A clamp recorded in this list left `scratch` readable as indirect
-    /// arguments. It stays so for every execution that reads it, until the
-    /// next clamp moves it back to unordered access.
+    /// arguments. It stays so until the next clamp into it or list close.
     pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
-        self.deferred().indirect_readable = scratch.as_raw() as usize;
+        let ptr = scratch.as_raw() as usize;
+        let mut deferred = self.deferred();
+        if !deferred.indirect_readable.contains(&ptr) {
+            deferred.indirect_readable.push(ptr);
+        }
+    }
+
+    /// Notes that a shader on this list may write UAVs, invalidating prior
+    /// UAV ordering for subsequent indirect argument clamps.
+    pub(crate) fn note_uav_write(&self) {
+        let mut d = self.deferred();
+        d.uav_clean_all = false;
+        d.uav_clean_srcs.clear();
+    }
+
+    /// Notes that a global `UAV(None)` barrier just ordered all prior UAV
+    /// writes on this list.
+    pub(crate) fn note_uav_barrier_all(&self) {
+        let mut d = self.deferred();
+        d.uav_clean_all = true;
+        d.uav_clean_srcs.clear();
+    }
+
+    /// Returns whether `resource` needs a targeted `UAV(resource)` barrier
+    /// before an indirect clamp reads it, and records it as ordered if so.
+    pub(crate) fn need_uav_barrier_for(&self, resource: &ID3D12Resource) -> bool {
+        let mut d = self.deferred();
+        if d.uav_clean_all {
+            return false;
+        }
+        let ptr = resource.as_raw() as usize;
+        if d.uav_clean_srcs.contains(&ptr) {
+            return false;
+        }
+        if d.uav_clean_srcs.len() < 32 {
+            d.uav_clean_srcs.push(ptr);
+        }
+        true
     }
 
     /// The list's buffers for `crate::indirect::window_check`.

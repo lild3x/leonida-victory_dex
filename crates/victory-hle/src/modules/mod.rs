@@ -12,12 +12,12 @@
 pub mod apu;
 pub mod audio;
 pub mod d3d12x;
+pub mod ffx;
 pub mod display;
 pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
-pub mod ffx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
