@@ -3280,6 +3280,7 @@ impl Shadow {
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
+        let mut runs: Vec<(usize, usize)> = Vec::new();
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3299,14 +3300,53 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                runs.push(((first * PAGE).max(from), (page * PAGE).min(to)));
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to)));
         }
+        // The notes stay locked until the bytes are in, as before.
+        bytes += self.copy_runs(&runs);
+        drop(copied);
         bytes
+    }
+
+    /// Copies the runs `[from, to)` of title memory into the copy: on
+    /// several threads in pieces of a megabyte when they come to more than
+    /// [`SPLIT_COPY`] bytes (`VICTORY_SPLIT_COPY=0`: one thread), else in
+    /// turn. The pieces write disjoint bytes of the copy.
+    fn copy_runs(&self, runs: &[(usize, usize)]) -> usize {
+        const PIECE: usize = 1 << 20;
+        let total: usize = runs.iter().map(|&(a, b)| b - a).sum();
+        if total < SPLIT_COPY || !split_copy() {
+            return runs.iter().map(|&(a, b)| self.copy(a, b)).sum();
+        }
+        let mut pieces = Vec::new();
+        for &(a, b) in runs {
+            let mut at = a;
+            while at < b {
+                let end = (at + PIECE).min(b);
+                pieces.push((at, end));
+                at = end;
+            }
+        }
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8).min(pieces.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(a, b)) = pieces.get(i) else { break };
+                        done.fetch_add(self.copy(a, b), Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        done.load(Ordering::Relaxed)
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
@@ -4318,4 +4358,13 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Bytes from which a refresh's copies are spread over threads.
+const SPLIT_COPY: usize = 4 << 20;
+
+/// [`Shadow::copy_runs`] on several threads: on unless `VICTORY_SPLIT_COPY=0`.
+fn split_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_COPY").is_none_or(|v| v != "0"))
 }

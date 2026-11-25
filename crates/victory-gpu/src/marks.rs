@@ -190,7 +190,7 @@ pub(crate) fn line() -> Option<String> {
     }
     let [a, b, c] = [0, 1, 2].map(|i| CHECKED[i].load(Ordering::Relaxed));
     let clears = CLEARS.load(Ordering::Relaxed);
-    Some(format!("write marks so far: {a} written pages checked, {b} NOT marked (must be 0), {c} not checkable (an unmarked writer ran); bitmap cleared {clears} times"))
+    Some(format!("write marks so far: {a} written pages checked, {b} NOT marked (must be 0), {c} not checkable (an unmarked writer ran); bitmap cleared {clears} times; stage 3 left {} MB unscanned", crate::host::MARKS_SKIPPED.load(std::sync::atomic::Ordering::Relaxed) >> 20))
 }
 
 /// A piece found written, unmarked while the marks were reliable: how many

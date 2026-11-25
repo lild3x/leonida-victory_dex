@@ -3464,6 +3464,18 @@ fn relay_worker() {
 /// once, the pieces that differ found on several threads; but the merge is
 /// `Shadow::relay_merge`, which does not write the copy, and the ranges
 /// are not done with here (each flight's are, afterwards).
+/// The page write marks note (`crate::marks`): 64 KiB.
+const MARK_PAGE: usize = 1 << 16;
+
+/// Bytes of declared ranges stage 3 of the marks left unscanned.
+pub(crate) static MARKS_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stage 3 of the write marks: on unless `VICTORY_MARKS_SKIP=0`.
+fn marks_skip() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MARKS_SKIP").is_none_or(|v| v != "0"))
+}
+
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
@@ -3475,6 +3487,34 @@ fn relay_hand_back(back: &[Declared]) {
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
         }
+        // Write marks, stage 3 (`VICTORY_VIEW_MARKS=1` and
+        // `VICTORY_MARKS_SKIP`, on by default with the marks): on a copy no
+        // unmarked program wrote since the bitmap was cleared, only the
+        // 64 KiB pages shaders marked can hold their writes; the others
+        // are left unscanned.
+        let spans: Vec<(usize, usize)> = if crate::marks::on() && marks_skip() && shadow.marks_reliable() {
+            let base = shadow.title_start() as usize;
+            let mut kept = Vec::new();
+            for (from, to) in spans {
+                let mut at = from;
+                while at < to {
+                    let page_end = ((base + at) / MARK_PAGE + 1) * MARK_PAGE - base;
+                    let end = page_end.min(to);
+                    if crate::marks::marked((base + at) as u64) {
+                        match kept.last_mut() {
+                            Some((_, e)) if *e == at => *e = end,
+                            _ => kept.push((at, end)),
+                        }
+                    } else {
+                        MARKS_SKIPPED.fetch_add((end - at) as u64, Ordering::Relaxed);
+                    }
+                    at = end;
+                }
+            }
+            kept
+        } else {
+            spans
+        };
         work.extend(
             spans
                 .into_iter()

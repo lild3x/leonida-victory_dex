@@ -11136,9 +11136,22 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             if typed {
-                // Write marks: a typed store's element size is not known here.
+                // Write marks: the element's bytes come from the host's stride
+                // table (the view's format), for a view picked from the heap;
+                // a span of 16 bytes (the widest element) only marks a page
+                // more, never one less.
                 if view_marks() {
-                    self.s.unmarked = true;
+                    let stride = match self.slot_stride(src) {
+                        Ok(Some(stride)) => Some(stride),
+                        _ => None,
+                    };
+                    match (stride, index) {
+                        (Some(stride), Some(index)) => {
+                            let byte = self.s.m.bin(self.cur, Bin::Mul, index, stride);
+                            self.mark_view_write(args[0], byte, 16);
+                        }
+                        _ => self.s.unmarked = true,
+                    }
                 }
             } else {
                 // The byte the store starts at in the view: args[1] for a raw
