@@ -101,6 +101,7 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     /// UAVs in a stage other than compute and pixel (write marks' bitmap).
     pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
+    pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -140,11 +141,11 @@ pub(crate) struct Geometry {
     pub max_vertices: u32,
 }
 
-/// The null slot a host view heap keeps at its end when the title's heap did not fit in it
-/// (0: no limit). Shaders translated while it is set read that slot for any view index at or
-/// past it: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
-/// larger) hung its GPU on reads past the end (GPU-based validation: "descriptor heap index
-/// out of bounds"), which AMD's driver forgives.
+/// The null slot every host view heap keeps at its end (0: no limit). Shaders translated while
+/// it is set read that slot for any view index at or past it. A read past a heap's end is
+/// undefined: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
+/// larger) hung its GPU (GPU-based validation: "descriptor heap index out of bounds"), and AMD
+/// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
@@ -152,7 +153,7 @@ pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// What [`set_view_heap_limit`] was told (0: nothing).
+/// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -820,6 +821,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
             features |= 0x4;
+        }
+        if self.flags & flags::DOUBLES != 0 {
+            features |= 0x1;
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
