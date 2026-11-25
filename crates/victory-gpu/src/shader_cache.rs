@@ -43,7 +43,10 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        // shortcut: the build is told by the translator's own sources (see
+        // `build.rs`), not by the whole executable, so rebuilding anything else
+        // keeps the cache. An older fork keyed it by the executable's BLAKE3.
+        let exe: std::io::Result<Vec<u8>> = Ok(env!("VICTORY_TRANSLATOR_HASH").as_bytes().to_vec());
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -54,6 +57,8 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // A diagnostics build and a plain one translate with other limits.
+                bytes.push(u8::from(cfg!(feature = "diagnostics")));
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
                 // So are the switches that pick the form of a wave64 program:
@@ -67,6 +72,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_F16_NEAREST",
                     "VICTORY_RT_STUB",
                     "VICTORY_POPS_SKIP",
+                    "VICTORY_INTERP_ZERO",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -89,6 +95,14 @@ fn build() -> &'static [u8; 32] {
             }
         }
     })
+}
+
+/// shortcut: offline warm-up. Translates `container` into the shader cache as the
+/// title's first bind would; true when it had to translate (a miss).
+pub fn prewarm(container: &[u8]) -> Result<bool, String> {
+    let before = MISSES.load(Ordering::Relaxed);
+    host_shader(container)?;
+    Ok(MISSES.load(Ordering::Relaxed) > before)
 }
 
 /// The translation of a console shader container, from the cache when

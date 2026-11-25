@@ -2466,7 +2466,12 @@ fn relay_hand_back(back: &[Declared]) {
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
         }
-        work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+        work.extend(
+            spans
+                .into_iter()
+                .filter(|&(from, to)| !no_back_kb().is_some_and(|kb| to - from >= kb << 10))
+                .map(|(from, to)| (shadow.clone(), from, to)),
+        );
     }
     if work.is_empty() {
         return;
@@ -2707,6 +2712,23 @@ fn read_backs(list: &HostList) {
     }
 }
 
+/// shortcut: `VICTORY_NO_BACK_CARD=1`. What shaders write in the copies kept in
+/// the card's memory is not fetched or merged into title memory. A test of
+/// what keeping title memory current costs a frame: the title no longer sees
+/// what the GPU wrote in those buffers.
+fn no_back_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NO_BACK_CARD").is_some_and(|v| v == "1"))
+}
+
+/// shortcut: `VICTORY_NO_BACK_KB=<n>`. The same for the ranges on the CPU's
+/// side that are `n` KiB or larger; smaller ones (counters, fences, indirect
+/// arguments) still go back.
+fn no_back_kb() -> Option<usize> {
+    static KB: OnceLock<Option<usize>> = OnceLock::new();
+    *KB.get_or_init(|| std::env::var("VICTORY_NO_BACK_KB").ok().and_then(|v| v.trim().parse().ok()))
+}
+
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
@@ -2767,6 +2789,9 @@ fn hand_back(back: &[Declared]) {
             }
         }
         for (from, to) in spans {
+            if no_back_kb().is_some_and(|kb| to - from >= kb << 10) {
+                continue;
+            }
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -3288,6 +3313,9 @@ impl Host {
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
     fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+        if no_back_card() {
+            return;
+        }
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -3547,6 +3575,9 @@ impl Host {
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
         for (i, r) in plan.ranges.iter().enumerate() {
+            if no_back_card() {
+                continue;
+            }
             for p in 0..r.span.pieces {
                 if r.compared && differs[(r.at + p) as usize] == 0 {
                     continue;

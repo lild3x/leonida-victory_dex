@@ -160,6 +160,26 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    // shortcut: `VICTORY_WARM=1` fills the game's own shader cache with every container found
+    // (same key as a run: set the same VICTORY_* switches and VICTORY_HOST_MAX_WAVE=32).
+    if std::env::var_os("VICTORY_WARM").is_some() {
+        let cfg = victory_core::Config::load()?;
+        victory_gpu::shader_cache::use_shader_cache(cfg.cache_subdir("shaders")?);
+        WARM.store(true, Ordering::Relaxed);
+        let mut total = 0u64;
+        for root in &paths {
+            for e in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+                if e.file_type().is_file() {
+                    let len = e.metadata().map_or(0, |m| m.len());
+                    if len <= MAX_FILE {
+                        total += len;
+                    }
+                }
+            }
+        }
+        WARM_TOTAL.store(total, Ordering::Relaxed);
+        println!("{:.1} GB de archivos para revisar; el 100% llega cuando termina de leerlos todos", total as f64 / 1e9);
+    }
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
@@ -196,12 +216,67 @@ pub fn run(
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
+            if WARM.load(Ordering::Relaxed) {
+                let len = entry.metadata().map_or(0, |m| m.len());
+                let done = WARM_BYTES.fetch_add(len, Ordering::Relaxed);
+                if len >= 8 << 20 {
+                    let total = WARM_TOTAL.load(Ordering::Relaxed).max(1);
+                    let fill = (done * 30 / total).min(30) as usize;
+                    println!(
+                        "[{}{}] {:>3}% de los archivos del juego revisados ({:.1}/{:.1} GB) | leyendo {} ({} MB) | shaders traducidos {}, ya estaban {}",
+                        "#".repeat(fill),
+                        ".".repeat(30 - fill),
+                        done * 100 / total,
+                        done as f64 / 1e9,
+                        total as f64 / 1e9,
+                        entry.file_name().to_string_lossy(),
+                        len >> 20,
+                        WARM_NEW.load(Ordering::Relaxed),
+                        WARM_HAD.load(Ordering::Relaxed)
+                    );
+                }
+            }
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
             let jobs = sources(&data);
+            if WARM.load(Ordering::Relaxed) && jobs.len() > 200 {
+                println!("{}: {} shaders encontrados, empiezo a traducir", entry.path().display(), jobs.len());
+            }
             let next = AtomicUsize::new(0);
+            let finished = std::sync::atomic::AtomicBool::new(false);
+            let started = std::time::Instant::now();
             std::thread::scope(|s| {
+                // `VICTORY_WARM`: a progress bar on stderr-free stdout, one line every 2 s.
+                if WARM.load(Ordering::Relaxed) && jobs.len() > 200 {
+                    let (total, next, finished) = (jobs.len(), &next, &finished);
+                    let name = entry.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    s.spawn(move || {
+                        while !finished.load(Ordering::Relaxed) {
+                            let done = next.load(Ordering::Relaxed).min(total);
+                            let secs = started.elapsed().as_secs_f64().max(0.1);
+                            let rate = done as f64 / secs;
+                            let left = if rate > 0.0 { (total - done) as f64 / rate } else { 0.0 };
+                            let fill = done * 30 / total;
+                            println!(
+                                "[{}{}] {:>3}% {}/{} | {:.0}/s | faltan ~{}:{:02} | {}: traduciendo shaders al cache (nuevos {}, ya estaban {}, fallan {})",
+                                "#".repeat(fill),
+                                ".".repeat(30 - fill),
+                                done * 100 / total,
+                                done,
+                                total,
+                                rate,
+                                (left / 60.0) as u64,
+                                (left % 60.0) as u64,
+                                name,
+                                WARM_NEW.load(Ordering::Relaxed),
+                                WARM_HAD.load(Ordering::Relaxed),
+                                WARM_BAD.load(Ordering::Relaxed)
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
+                    });
+                }
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         let mut t = Tally {
@@ -218,13 +293,34 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            if WARM.load(Ordering::Relaxed) {
+                                warm(job, &seen);
+                            } else {
+                                translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            }
                         }
                         lock(&total).merge(t);
                     });
                 }
+                // the workers end when `next` runs out: release the bar once they are all done
+                s.spawn(|| {
+                    while next.load(Ordering::Relaxed) < jobs.len() {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    finished.store(true, Ordering::Relaxed);
+                });
             });
         }
+    }
+    if WARM.load(Ordering::Relaxed) {
+        println!(
+            "warm         {} translated now, {} already cached, {} failed",
+            WARM_NEW.load(Ordering::Relaxed),
+            WARM_HAD.load(Ordering::Relaxed),
+            WARM_BAD.load(Ordering::Relaxed)
+        );
+        return Ok(());
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
@@ -304,6 +400,29 @@ pub fn run(
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
     Ok(())
+}
+
+static WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARM_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WARM_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WARM_NEW: AtomicUsize = AtomicUsize::new(0);
+static WARM_HAD: AtomicUsize = AtomicUsize::new(0);
+static WARM_BAD: AtomicUsize = AtomicUsize::new(0);
+
+fn warm(source: &Source, seen: &Mutex<HashSet<blake3::Hash>>) {
+    let Some(bytes) = source.bytes() else { return };
+    if !lock(seen).insert(blake3::hash(&bytes)) {
+        return;
+    }
+    let Ok(c) = Container::parse(&bytes) else { return };
+    if c.part(FourCC::DXIL).is_none() {
+        return;
+    }
+    match victory_gpu::shader_cache::prewarm(&bytes) {
+        Ok(true) => WARM_NEW.fetch_add(1, Ordering::Relaxed),
+        Ok(false) => WARM_HAD.fetch_add(1, Ordering::Relaxed),
+        Err(_) => WARM_BAD.fetch_add(1, Ordering::Relaxed),
+    };
 }
 
 fn translate(

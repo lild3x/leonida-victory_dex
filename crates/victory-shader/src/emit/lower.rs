@@ -1268,6 +1268,11 @@ fn trace_missing() -> bool {
 /// POPS (primitive ordered pixel shading) run without its ordering: overlapping
 /// fragments of different primitives are no longer processed in primitive
 /// order. Nothing else of the program changes.
+fn interp_zero() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INTERP_ZERO").is_some())
+}
+
 fn pops_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_POPS_SKIP").is_some())
@@ -6168,6 +6173,17 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
+            // shortcut: a sampler chosen by control flow between immediate samplers (DXIL
+            // refuses a phi of handles): the first immediate one stands for the choice
+            Source::Phi { args, .. }
+                if sampler && args.iter().any(|a| matches!(a, Source::Constant(_))) =>
+            {
+                let first = args
+                    .iter()
+                    .find(|a| matches!(a, Source::Constant(_)))
+                    .ok_or("a sampler chosen by control flow")?;
+                self.handle(site, first, sampler, props)
+            }
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
@@ -6220,7 +6236,7 @@ impl<'a> Lower<'a> {
             if self.block[q].is_none() {
                 continue;
             }
-            let tail = self.tail[q].ok_or(WHY)?;
+            let tail = self.tail[q].ok_or("DIAG phi: predecessor not emitted yet")?;
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
             let index = match arg {
                 Source::Loaded { load, first } => {
@@ -6232,11 +6248,22 @@ impl<'a> Lower<'a> {
                 Source::Phi { block: inner, args: inner_args } if depth > 0 => {
                     self.descriptor_phi(*inner, inner_args, sampler, depth - 1)?
                 }
-                _ => return Err(WHY),
+                // shortcut: a join of per-lane picks (a select, a lane choice, a fetched
+                // descriptor): each lane's own heap index, computed at the edge
+                Source::Select { .. } | Source::Lanes { .. } | Source::Fetched { .. } | Source::LanePhi { .. } => {
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.lane_heap_index(arg, sampler);
+                    self.cur = here;
+                    index?
+                }
+                Source::Phi { .. } => return Err("DIAG phi: nested phi too deep"),
+                Source::Constant(_) => return Err("DIAG phi: constant"),
+                Source::Built { .. } => return Err("DIAG phi: built"),
+                _ => return Err("DIAG phi: other source kind"),
             };
             incoming.push((index, at));
         }
-        let join = self.block[block].ok_or(WHY)?;
+        let join = self.block[block].ok_or("DIAG phi: join block not emitted")?;
         let phi = self.s.m.phi(join, self.s.t.i32);
         self.s.m.set_phi(phi, incoming);
         Ok(phi)
@@ -8629,6 +8656,22 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
+            // shortcut: `VICTORY_INTERP_ZERO`. A first half that no second half
+            // took over reads as zero instead of stopping whatever reads it, so
+            // that the program (the deferred shaders of walls and floors, two
+            // of them) translates and its draws are not dropped.
+            if interp_zero() {
+                let dst = match &inst.fields {
+                    Fields::Vintrp { dst, .. } => Some(*dst),
+                    Fields::Valu(v) => v.dst,
+                    _ => None,
+                };
+                if let Some(Operand::Vector { reg, .. }) = dst {
+                    let zero = self.s.m.i32(0);
+                    self.write(inst, Reg::V(reg), zero, None);
+                    return Ok(());
+                }
+            }
             return Err("the first half of an interpolation");
         };
         let name = inst.name();
