@@ -149,8 +149,14 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 }
             }
         }
-        ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => std::hint::spin_loop(),
+        // perf: patched like clwb, the first time each is met: monitorx to NOPs,
+        // mwaitx to `pause; nop` (the wait loop around it checks its condition
+        // again). They ran thousands of times a second, an exception each.
+        ConsoleOnly::Monitorx => patch(rip, len, &[0x90, 0x90, 0x90]),
+        ConsoleOnly::Mwaitx => {
+            std::hint::spin_loop();
+            patch(rip, len, &[0xF3, 0x90, 0x90]);
+        }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
@@ -246,4 +252,37 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         );
     }
     CONTINUE_EXECUTION
+}
+
+/// Writes `bytes` (exactly `len` of them) over the instruction at `rip`.
+fn patch(rip: usize, len: usize, bytes: &[u8]) {
+    if bytes.len() != len || (rip & 7) + len > 8 {
+        return;
+    }
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    let mut old = 0u32;
+    // SAFETY: the instruction's own bytes, made writable for the patch and restored.
+    unsafe {
+        if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+            // In one atomic write of the aligned quadword that holds it: another
+            // thread may be running these bytes (a half-patched `mwaitx` reads as
+            // another instruction).
+            let base = rip & !7;
+            let word = &*(base as *const std::sync::atomic::AtomicU64);
+            let at = (rip - base) * 8;
+            let mut cur = word.load(Relaxed);
+            loop {
+                let mut new = cur;
+                for (k, &b) in bytes.iter().enumerate() {
+                    let sh = at + 8 * k;
+                    new = new & !(0xFFu64 << sh) | (u64::from(b) << sh);
+                }
+                match word.compare_exchange_weak(cur, new, std::sync::atomic::Ordering::SeqCst, Relaxed) {
+                    Ok(_) => break,
+                    Err(c) => cur = c,
+                }
+            }
+            VirtualProtect(rip as *const _, len, old, &mut old);
+        }
+    }
 }

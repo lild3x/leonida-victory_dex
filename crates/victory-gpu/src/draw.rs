@@ -1039,6 +1039,24 @@ impl State {
             // marks 0: the program writes no buffer (nothing it declares changes by it)
             crate::marks::set_binding(t.host.marks != 2);
             crate::marks::set_writer(&stage.shader.hash, t.host.marks);
+            TRACING.set(trace_on(&stage.shader.hash));
+            if trace_on(&stage.shader.hash) {
+                let tables: Vec<u64> = self
+                    .roots_ref(compute)
+                    .iter()
+                    .filter_map(|r| match r {
+                        Root::Table(h) => Some(*h),
+                        _ => None,
+                    })
+                    .collect();
+                for h in tables {
+                    for k in 0..10u64 {
+                        if let Some(v) = crate::descriptor::view(h + 0x20 * k) {
+                            trace_view(&stage.shader.hash, h, k, &v);
+                        }
+                    }
+                }
+            }
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
@@ -1221,6 +1239,9 @@ impl State {
                         None
                     }
                 };
+                if let Some(a) = address {
+                    trace_root_uav(&stage.shader.hash, slot, a);
+                }
                 if !self.root_uav(list, address, param, compute, writes) {
                     return false;
                 }
@@ -3387,6 +3408,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // A traced program's inputs go with F11's targets.
+            #[cfg(feature = "diagnostics")]
+            if TRACING.get() {
+                crate::capture::note_target(*resource as This);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -3616,4 +3642,83 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
     }
+}
+
+/// `VICTORY_TRACE_HASH=<hash prefix>,...` (diagnostics): each time a program
+/// of those binds a root view it writes, its address and the first values
+/// title memory holds there now (what the CPU last saw: the previous run's
+/// results once they were copied back). At most 400 lines.
+fn trace_on(hash: &str) -> bool {
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_HASH")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    !only.is_empty() && only.iter().any(|o| hash.starts_with(o.as_str()))
+}
+
+/// A view a traced program's table holds (record `k`, 32 bytes apart).
+fn trace_view(hash: &str, table: u64, k: u64, view: &crate::descriptor::View) {
+    // Only what the program writes, a line per frame and view at most.
+    let crate::descriptor::View::Unordered(resource, _, d) = view else {
+        return;
+    };
+    static LAST: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let frame = crate::frame::current();
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.iter().any(|&(f, t, kk)| f / 30 == frame / 30 && t == table && kk == k) || last.len() > 3000 {
+            return;
+        }
+        last.push((frame, table, k));
+    }
+    let address = crate::resource::buffer_bytes(*resource as crate::object::This).map(|(p, _)| {
+        let d = d.unwrap_or_default();
+        let first = u64::from(d[2]) | u64::from(d[3]) << 32;
+        let stride = if d[5] != 0 { u64::from(d[5]) } else { 4 };
+        p as u64 + first * stride
+    });
+    let mut words = [0u32; 8];
+    if let Some(a) = address.filter(|&a| a != 0) {
+        crate::host::copy_mapped(words.as_mut_ptr().cast::<u8>(), a as *const u8, 32, false);
+    }
+    let _ = frame;
+    tracing::info!(
+        frame = crate::frame::current(),
+        hash,
+        table = format_args!("{table:#x}"),
+        k,
+        address = format_args!("{:#x}", address.unwrap_or(0)),
+        "TRACE table view {view:x?}: now {words:08x?} = {:?}",
+        words.map(f32::from_bits)
+    );
+}
+
+fn trace_root_uav(hash: &str, slot: u8, address: u64) {
+    if !trace_on(hash) {
+        return;
+    }
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= 400 {
+        return;
+    }
+    let mut words = [0u32; 8];
+    crate::host::copy_mapped(words.as_mut_ptr().cast::<u8>(), address as *const u8, 32, false);
+    let floats = words.map(f32::from_bits);
+    tracing::info!(
+        frame = crate::frame::current(),
+        hash,
+        slot,
+        address = format_args!("{address:#x}"),
+        "TRACE root view written: now {words:08x?} = {floats:?}"
+    );
+}
+
+thread_local! {
+    /// The program being bound is one `VICTORY_TRACE_HASH` names.
+    static TRACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
