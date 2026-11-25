@@ -486,6 +486,11 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.pixel {
+            split_mixed_rows(&mut self.inputs);
+        } else if self.threads.is_none() {
+            split_mixed_rows(&mut self.outputs);
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -930,5 +935,52 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+
+/// DXIL packs only elements of one interpolation mode into a signature row;
+/// the console's signature may hold a linear float beside a constant
+/// integer in one row (the vehicle water-interface programs: 84 of the
+/// pack). Elements whose mode differs from the first of their row move, by
+/// mode, to rows of their own past the last one, keeping their column.
+/// Loads name elements, not rows, so the code is unchanged.
+/// shortcut: the previous stage keeps its rows; D3D12 links stages by
+/// semantic.
+fn split_mixed_rows(els: &mut [SigElement]) {
+    let mut next = els.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+    let mut rows: Vec<u32> = els.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let mut members: Vec<usize> = (0..els.len()).filter(|&i| els[i].row == Some(row)).collect();
+        members.sort_by_key(|&i| els[i].col);
+        // An element nothing reads takes the mode of one that is read: no
+        // row moves for it.
+        if let Some(&read) = members.iter().find(|&&i| els[i].usage != 0) {
+            let mode = els[read].interp;
+            for &i in &members {
+                if els[i].usage == 0 {
+                    els[i].interp = mode;
+                }
+            }
+        }
+        let first = els[members[0]].interp;
+        let mut moved: Vec<(u8, u32)> = Vec::new();
+        for &i in &members[1..] {
+            let mode = els[i].interp;
+            if mode == first {
+                continue;
+            }
+            let to = match moved.iter().find(|m| m.0 == mode) {
+                Some(&(_, to)) => to,
+                None => {
+                    moved.push((mode, next));
+                    next += 1;
+                    next - 1
+                }
+            };
+            els[i].row = Some(to);
+        }
     }
 }
