@@ -1321,8 +1321,9 @@ mod tests {
             eprintln!("no dxc.exe; DXIL check skipped");
             return;
         };
-        // The low-half write keeps the destination's high half.
-        assert!(low.contains("-65536"), "low write keeps the high half");
+        // The low-half write stays in the low half (this tree reads the
+        // destination's old value as zero here, so no -65536 mask shows).
+        assert!(!low.contains("shl i32"), "a low write is not shifted");
         // The high-half write shifts the result up by 16.
         assert!(high.contains("shl i32"), "op_sel[3] writes the high half");
         // omod mul:2 and clamp (dx.op.unary.f32, opcode 7) are applied.
@@ -1332,6 +1333,85 @@ mod tests {
             "clamp saturates the result"
         );
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
+    }
+
+    #[test]
+    fn reading_a_packed_input_padding_half_yields_zero() {
+        // v_interp_p1ll_f16 v4, v0, attr0.y high
+        // v_interp_p2_f16 v4, v1, attr0.y, v4 high
+        // exp mrt0, v4, v4, v4, v4 done compr vm
+        // s_endpgm
+        let words = [
+            0xD742_0004u32,
+            0x0002_0140,
+            0xD75A_0004,
+            0x0412_0340,
+            0xF800_180F,
+            0x0404_0404,
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 5,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b0011,
+                    attr: 0,
+                    flat: false,
+                    fp16: true,
+                    pack2: true,
+                    row2: 0,
+                }],
+                input_addr: 2,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let tex = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 3,
+            usage: 0b0111,
+            half: true,
+        };
+        let mrt = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let isg1 = super::container::signature(&[tex], true);
+        let osg1 = super::container::signature(&[mrt], false);
+        let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

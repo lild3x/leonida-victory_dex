@@ -185,6 +185,9 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Resource properties of each heap handle made, in creation order.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
     /// Write marks: the heap index of each unordered buffer view's handle.
     pub view_index: std::collections::HashMap<V, V>,
     /// Write marks: some write was marked / some buffer write could not be.
@@ -246,6 +249,8 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            heap_props: Vec::new(),
             view_index: std::collections::HashMap::new(),
             marked: false,
             unmarked: false,
@@ -467,6 +472,8 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        #[cfg(test)]
+        self.heap_props.push(props);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
