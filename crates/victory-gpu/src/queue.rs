@@ -61,7 +61,7 @@ enum Held {
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
     /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    Present(Vec<crate::layers::Layer>, u64),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -145,27 +145,19 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     if crate::capture::wanted(frame) || crate::capture::listed(frame) {
         return false;
     }
-    // SAFETY: the title passes `planes` plane descriptions.
-    let Some(plane) = (unsafe { plane_parameters.as_ref() }) else {
-        return false;
+    let all: &[Plane] = if planes == 0 || plane_parameters.is_null() {
+        &[]
+    } else {
+        // SAFETY: the title passes `planes` plane descriptions.
+        unsafe { std::slice::from_raw_parts(plane_parameters, planes as usize) }
     };
-    if plane.count == 0 || plane.resources.is_null() {
+    let layers = layers_of(all);
+    if layers.is_empty() {
         return false;
     }
-    // SAFETY: the plane lists `count` resources.
-    let resource = unsafe { *plane.resources };
-    let Some(texture) = crate::resource::host_resource(resource) else {
-        return false;
-    };
-    // The state the lists recorded so far leave the texture in: what our
-    // copy finds it in when it runs behind them (looked at, not changed).
-    const COPY_SOURCE: u32 = 0x800;
-    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-    crate::resource::host_transition(resource, state);
-    let texture = texture.clone();
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(layers, frame)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -873,10 +865,10 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(layers, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(&layers, frame);
                             }
                         };
                         if all {
@@ -1482,26 +1474,19 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     log_first_presents(frame, all);
     #[cfg(windows)]
-    let (shown, index) = shown_plane();
-    #[cfg(windows)]
     if !sent_behind
-        && let Some(plane) = all.get(shown).or(all.first())
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources.add(index.min(plane.count as usize - 1)) }
-        && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let layers = layers_of(all);
+        if !layers.is_empty() {
+            let shown = host.present(&layers, frame);
+            #[cfg(feature = "diagnostics")]
+            if let Some(&resource) = (!all.is_empty() && !all[0].resources.is_null()).then(|| unsafe { &*all[0].resources }) {
+                blinks(frame, resource, layers[0].state, shown);
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
@@ -1766,4 +1751,42 @@ mod tests {
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
     }
+}
+
+/// The resources of a present's planes as layers, in submission order, each
+/// with the state the lists recorded so far leave it in (looked at, not
+/// changed); with `VICTORY_PRESENT_PLANE` the one it names alone.
+#[cfg(windows)]
+fn layers_of(all: &[Plane]) -> Vec<crate::layers::Layer> {
+    const COPY_SOURCE: u32 = 0x800;
+    let picked = std::env::var_os("VICTORY_PRESENT_PLANE").is_some().then(shown_plane);
+    let mut layers = Vec::new();
+    for (p, plane) in all.iter().enumerate() {
+        if plane.resources.is_null() {
+            continue;
+        }
+        for r in 0..plane.count as usize {
+            if let Some((pp, rr)) = picked
+                && (pp.min(all.len() - 1), rr.min(plane.count as usize - 1)) != (p, r)
+            {
+                continue;
+            }
+            // SAFETY: the plane lists `count` resources, and as many source
+            // rectangles and placements when it gives them.
+            let (resource, source, place) = unsafe {
+                (
+                    *plane.resources.add(r),
+                    (!plane.source_rects.is_null()).then(|| *plane.source_rects.add(r)),
+                    (!plane.placements.is_null()).then(|| *plane.placements.cast::<[f32; 4]>().add(r)),
+                )
+            };
+            let Some(texture) = crate::resource::host_resource(resource) else {
+                continue;
+            };
+            let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+            crate::resource::host_transition(resource, state);
+            layers.push(crate::layers::Layer { texture: texture.clone(), state, source, place });
+        }
+    }
+    layers
 }

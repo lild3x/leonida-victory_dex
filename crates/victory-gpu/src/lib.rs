@@ -79,6 +79,8 @@ mod texture;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod layers;
 
 #[cfg(windows)]
 pub use host::on_failure;

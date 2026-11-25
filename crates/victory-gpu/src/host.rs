@@ -8112,21 +8112,43 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(&self, layers: &[crate::layers::Layer], frame: u64) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(layers, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-        // SAFETY: a live resource.
-        let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
-            tracing::warn!(format = desc.Format.0, "cannot present this format");
-            return None;
+    fn present_now(&self, layers: &[crate::layers::Layer], frame: u64) -> Option<bool> {
+        let first = layers.first()?;
+        let texture = &first.texture;
+        let state = first.state;
+        // SAFETY: live resources.
+        let descs: Vec<_> = layers.iter().map(|l| unsafe { l.texture.GetDesc() }).collect();
+        let desc = &descs[0];
+        let whole = [0, 0, desc.Width as i32, desc.Height as i32];
+        let copied = layers.len() == 1
+            && first.texels(desc.Width as u32, desc.Height) == whole
+            && first.fractions() == [0.0, 0.0, 1.0, 1.0]
+            && swap_format(desc.Format).is_some();
+        let (format, width, height) = if copied {
+            (swap_format(desc.Format)?, desc.Width as u32, desc.Height)
+        } else {
+            let Some(format) = descs.iter().find_map(|d| swap_format(d.Format)) else {
+                tracing::warn!(format = desc.Format.0, "cannot present this format");
+                return None;
+            };
+            let width = descs.iter().map(|d| d.Width as u32).max()?;
+            (format, width, descs.iter().map(|d| d.Height).max()?)
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        // Planes drawn one over the other need our pass; without it the
+        // first is copied alone if it can be.
+        let copied = copied || (!crate::layers::ready(format) && swap_format(desc.Format).is_some());
+        let (format, width, height) = if copied && layers.len() > 1 {
+            (swap_format(desc.Format)?, desc.Width as u32, desc.Height)
+        } else {
+            (format, width, height)
+        };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -8195,6 +8217,21 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            if !copied {
+                crate::layers::record(self, list, &back, layers, (width, height, format));
+                crate::fpsbox::draw(self, list, &back, (width, height, format));
+                copy.close();
+                match slot {
+                    Some(i) => {
+                        let flown = self.execute_own(copy);
+                        p.ahead[i].1 = flown;
+                    }
+                    None => self.execute(&[copy]),
+                }
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+                p.meter.frame(p.hwnd);
+                return Some(false);
+            }
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
