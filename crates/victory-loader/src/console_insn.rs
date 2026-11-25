@@ -594,3 +594,13 @@ mod tests {
         assert!(block[at + 64..].iter().all(|&b| b == 0xAA), "one line only");
     }
 }
+
+/// Copies `out.len()` bytes at `va` into `out` if they are readable.
+pub(crate) fn readable_bytes(va: usize, out: &mut [u8]) -> bool {
+    if !readable(va, out.len()) {
+        return false;
+    }
+    // SAFETY: the bytes are readable.
+    unsafe { std::ptr::copy_nonoverlapping(va as *const u8, out.as_mut_ptr(), out.len()) };
+    true
+}

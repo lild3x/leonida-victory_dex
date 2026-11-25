@@ -371,6 +371,10 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
+    if unsafe { skip_watchdog(info) } {
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
         unsafe { report("first-chance exception", info, false) };
@@ -997,4 +1001,48 @@ mod tests {
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
     }
+}
+
+/// `VICTORY_NO_WATCHDOG=1`: the title's watchdog ends the process with a
+/// store of a constant to address 0 (`mov dword/qword ptr [0], imm32`, at
+/// +0x23cf683 and +0x2215c35 of the title: Marvisak/VIctory#1118) when its
+/// main thread has waited too long, as it does when a frame or a load
+/// takes seconds here. The store is stepped over and the title goes on;
+/// nothing else that faults on address 0 is touched (the bytes must be
+/// that exact form).
+///
+/// # Safety
+/// `info` comes from the system, for an exception being dispatched.
+unsafe fn skip_watchdog(info: *mut EXCEPTION_POINTERS) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_NO_WATCHDOG").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    // SAFETY: the system's record and context.
+    let (record, ctx) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+    const ACCESS_VIOLATION: i32 = 0xC000_0005_u32 as i32;
+    if record.ExceptionCode != ACCESS_VIOLATION
+        || record.NumberParameters < 2
+        || record.ExceptionInformation[0] != 1
+        || record.ExceptionInformation[1] >= 0x10
+    {
+        return false;
+    }
+    let rip = ctx.Rip as usize;
+    let mut code = [0u8; 12];
+    if !crate::console_insn::readable_bytes(rip, &mut code) {
+        return false;
+    }
+    // C7 04 25 <disp32 = 0> <imm32>, with REX.W (48) or without.
+    let at = usize::from(code[0] == 0x48);
+    let form = code[at] == 0xC7 && code[at + 1] == 0x04 && code[at + 2] == 0x25 && code[at + 3..at + 7] == [0, 0, 0, 0];
+    if !form {
+        return false;
+    }
+    ctx.Rip += (at + 11) as u64;
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+        tracing::warn!(at = format_args!("{rip:#x}"), "the title's watchdog fired: stepped over (VICTORY_NO_WATCHDOG=1)");
+    }
+    true
 }
