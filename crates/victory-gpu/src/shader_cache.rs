@@ -254,6 +254,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     word(&mut out, u32::from(s.marks));
     out
 }
@@ -323,6 +328,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     // Write marks: absent in entries written before they existed.
     let marks = if r.0.len() >= 4 { u8::try_from(r.word()?).ok()? } else { 0 };
     r.0.is_empty().then_some(HostShader {
@@ -336,6 +346,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_indexed_views,
         marks,
+        half_views,
     })
 }
 
@@ -371,6 +382,7 @@ mod tests {
                 shift: 5,
             }],
             marks: 1,
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

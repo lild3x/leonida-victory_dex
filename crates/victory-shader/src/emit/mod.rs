@@ -269,6 +269,12 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel: the host
+    /// shows a 16-bit float or signed buffer view there as the unsigned
+    /// format of the same layout, whose bits the DXIL moves unchanged
+    /// (fxceless/victory-fork #927).
+    pub half_views: Vec<(u8, u32)>,
     /// Write marks (`SLOT_MARKS`): 0 the program marks nothing, 1 it marks
     /// every buffer write it makes, 2 it marks some but not all (the host
     /// must not rely on its marks).
@@ -708,6 +714,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
         marks: l.marks,
     };
     Ok((shader, wave_size))
@@ -1084,6 +1091,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
             marks: 0,
         };
         let file = |var: &str, stage| {
@@ -1097,6 +1105,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
                 marks: 0,
             })
         };
@@ -1586,6 +1595,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
                 marks: 0,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
