@@ -43,6 +43,10 @@ Marvisak) hasta ver el mundo 3D bien iluminado. Prioridad: que se vea bien; los 
   estables. `fx-local` (fork `fxceless/victory-fork` + #969 + nuestros atajos) queda como respaldo; commits locales, sin push.
 - Revisados y descartados: `Zettrox/ztrx` = mismo codigo que fxceless `2119b0e` (solo otro README); `xcl-dev/xcl`
   comparte memoria sin copias pero exige reescribir la reserva de memoria (probado solo Win11/AMD).
+- **xcl probado el 24/11** (`D:\victory-data\xcl`, build en `target_xcl`, lanzador `jugar_xcl.ps1`, datos en `F:\xcl-data`,
+  DXC 1.9.2609 en `D:\victory-data\dxc`): arranca y dibuja menus, pero precompila ~58.700 pipelines de a 2-4 hilos
+  (~32/min = ~30 h) y crashea (0xc0000005 en VCRUNTIME140) al pasar al 3D con `XCL_DIRECT_DXIL=1` +
+  `XCL_HUGE_PSO_CONCURRENCY=2`. Descartado por ahora; seguimos con VIctory.
 - Medido y descartado en esta PC: `VICTORY_INPLACE=1` (solo 4 MB sin copia, 1,8 fps), `VICTORY_NO_BACK_*`
   (baja "vuelta" pero no el frame), combo `LATE_WAIT=3 WIDE_BACK=1 CARD_BUFFERS_*` (630 ms, picos de 2,9 s).
   El cuello del frame es "preparar". Seguir con `RELAY=2`.

@@ -281,6 +281,24 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     true
 }
 
+/// Diagnostics (A/B): `VICTORY_ALL_WRITTEN=1` answers every page of every
+/// range asked as written, so every refresh copies its whole range again: to
+/// tell stale host copies (writes the tracking misses) from translation
+/// faults. Slow on purpose.
+fn all_written() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALL_WRITTEN").is_some_and(|v| v == "1"))
+}
+
+/// With [`all_written`]: every page of `first..last` as written at `now`.
+fn every_page(first: usize, last: usize, now: u64, found: Vec<(usize, u64)>) -> Vec<(usize, u64)> {
+    if all_written() {
+        (first..last).map(|p| (p, now)).collect()
+    } else {
+        found
+    }
+}
+
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
 /// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
 /// pages written since tracking began and the asking that last found each
@@ -292,7 +310,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, every_page(first, last, j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect())))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -310,10 +328,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
             j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
+            every_page(
+                first,
+                last,
+                j.ahead_asked,
+                j.written
+                    .range(first..last)
+                    .map(|(&p, &w)| (p, w))
+                    .collect(),
+            ),
         ));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -361,10 +384,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     Some((
         now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
+        every_page(
+            first,
+            last,
+            now,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ),
     ))
 }
 

@@ -2920,6 +2920,13 @@ impl Host {
 
     /// The card's clock ([`CARD_CLOCK_US`]), made at the first send.
     fn card_clock(&self) -> Option<&'static CardClock> {
+        // perf: opt-in (`VICTORY_CARD_CLOCK=1`). It puts one more Signal on the
+        // queue and wakes a thread at every submission, only to report the
+        // card's idle time on the frame line (~1.5 % of the process).
+        static WANTED: OnceLock<bool> = OnceLock::new();
+        if !*WANTED.get_or_init(|| std::env::var_os("VICTORY_CARD_CLOCK").is_some_and(|v| v == "1")) {
+            return None;
+        }
         static CLOCK: OnceLock<Option<CardClock>> = OnceLock::new();
         static WATCH: std::sync::Once = std::sync::Once::new();
         let clock = CLOCK

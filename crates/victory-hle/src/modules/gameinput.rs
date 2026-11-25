@@ -59,7 +59,9 @@ const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 32;
-const POLL: Duration = Duration::from_millis(8);
+// perf: 16 ms (was 8): each poll asks the host for ~250 keys one by one
+// (GetAsyncKeyState), ~2-3 % of the process in the CPU profile.
+const POLL: Duration = Duration::from_millis(16);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.

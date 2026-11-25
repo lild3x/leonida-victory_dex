@@ -82,7 +82,9 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+// perf: an RwLock, not a Mutex: every draw that samples a texture asks it,
+// from every recording thread at once (lock_contended in the CPU profile).
+static STAGING: std::sync::RwLock<Option<HashMap<usize, Arc<Staging>>>> = std::sync::RwLock::new(None);
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -404,7 +406,7 @@ impl Drop for Staging {
 pub(crate) fn memory() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let kept = STAGING
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map_or(0, |map| map.len() as u64);
@@ -432,7 +434,14 @@ pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    // perf: once per frame, not before every submission (dozens a frame,
+    // each walking the whole map under the exclusive lock): what it lets go
+    // has been idle for seconds.
+    static LAST_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    if LAST_FRAME.swap(crate::frame::current(), Relaxed) == crate::frame::current() {
+        return;
+    }
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
     };
@@ -458,11 +467,11 @@ pub(crate) fn let_go_idle() {
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: std::sync::RwLock<Option<std::collections::HashSet<usize>>> = std::sync::RwLock::new(None);
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
     set.get_or_insert_with(Default::default)
         .insert(resource as usize);
 }
@@ -472,7 +481,7 @@ pub(crate) fn host_written(resource: This) {
 /// memory.
 pub(crate) fn host_wrote(resource: usize) -> bool {
     HOST_WRITTEN
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&resource))
@@ -480,11 +489,11 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut set = HOST_WRITTEN.write().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
     }
@@ -515,7 +524,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// what lies there is another texture's.
 pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
     let host_written = HOST_WRITTEN
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&(resource as usize)));
@@ -880,7 +889,7 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&(resource as usize));
     }
@@ -893,7 +902,7 @@ pub(crate) fn unstage(resource: This) {
 /// index alone.
 pub(crate) fn upload_again(resource: This) {
     let staging = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
         map.as_ref().and_then(|map| map.get(&(resource as usize)).cloned())
     };
     if let Some(staging) = staging {
@@ -905,7 +914,7 @@ pub(crate) fn upload_again(resource: This) {
 /// Whether a title texture has a staging buffer: a list recorded its
 /// upload, and the lists that sample it check it at submission.
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
@@ -913,7 +922,7 @@ pub(crate) fn is_staged(resource: This) -> bool {
 /// if the texture has been staged for upload.
 pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     let s = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     Some((s.size as u64, committed(s.memory, s.size)))
@@ -922,7 +931,7 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 /// The first mip a title texture's staging buffer holds; `u32::MAX` without
 /// one.
 fn staged_from(resource: This) -> u32 {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .and_then(|map| map.get(&(resource as usize)))
         .map_or(u32::MAX, |s| s.first)
@@ -1083,7 +1092,17 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 /// The staging state of a title texture from mip `first` on, made on first
 /// use (and made anew for larger mips than the one there holds).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    // perf: the common case (the staging buffer is there) under a shared lock.
+    if let Some(s) = STAGING
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        && s.first <= first
+    {
+        return Some(s.clone());
+    }
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
         && s.first <= first

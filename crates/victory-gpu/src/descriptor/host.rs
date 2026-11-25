@@ -26,6 +26,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// perf: `made`'s keys again, readable without its lock: a draw whose
+    /// slot shows what the title wrote there already (nearly every one)
+    /// takes no lock in [`Self::mirror`]. Written wherever `made` is, after it.
+    seen: Vec<std::sync::atomic::AtomicU64>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -695,6 +699,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            seen: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, taken)),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC - 1),
@@ -1089,6 +1094,9 @@ impl HostHeap {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
+        if let Some(seen) = self.seen.get(index as usize) {
+            seen.store(0, std::sync::atomic::Ordering::Release);
+        }
         if key == 0 {
             return;
         }
@@ -1476,6 +1484,12 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // perf: the slot shows this record already: no lock (`seen`).
+        if tag == VIEW_TAG && self.seen[index as usize].load(std::sync::atomic::Ordering::Acquire) == key {
+            if let Some(view) = view_at(i, generation) {
+                return Some(view);
+            }
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -1483,6 +1497,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.seen[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1534,6 +1549,7 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            self.seen[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
         Some(view)
     }
