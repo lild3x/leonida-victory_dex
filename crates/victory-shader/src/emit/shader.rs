@@ -488,8 +488,11 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         if self.pixel {
             split_mixed_rows(&mut self.inputs);
-        } else if self.threads.is_none() {
-            split_mixed_rows(&mut self.outputs);
+        } else if self.threads.is_none() || self.mesh.is_some() {
+            // An output's mode is the next stage's business (the pixel
+            // inputs declare their own): one mode per row, the first's.
+            one_mode_per_row(&mut self.outputs);
+            one_mode_per_row(&mut self.prims);
         }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
@@ -957,10 +960,18 @@ fn split_mixed_rows(els: &mut [SigElement]) {
         members.sort_by_key(|&i| els[i].col);
         // An element nothing reads takes the mode of one that is read: no
         // row moves for it.
-        if let Some(&read) = members.iter().find(|&&i| els[i].usage != 0) {
-            let mode = els[read].interp;
-            for &i in &members {
-                if els[i].usage == 0 {
+        let read = members.iter().find(|&&i| els[i].usage != 0).copied();
+        // Nothing read in the row: constant if it holds an integer (or a
+        // system value), else the first's mode.
+        let mode = match read {
+            Some(i) => els[i].interp,
+            None if members.iter().any(|&i| els[i].comp != 9) => 1,
+            None => els[members[0]].interp,
+        };
+        for &i in &members {
+            if els[i].usage == 0 && els[i].interp != 0 {
+                // An unread integer stays constant beside a read float.
+                if !(els[i].comp != 9 && mode != 1) {
                     els[i].interp = mode;
                 }
             }
@@ -981,6 +992,25 @@ fn split_mixed_rows(els: &mut [SigElement]) {
                 }
             };
             els[i].row = Some(to);
+        }
+    }
+}
+
+/// Every element of a row takes the mode of the row's first (by column).
+fn one_mode_per_row(els: &mut [SigElement]) {
+    let rows: std::collections::BTreeSet<u32> = els.iter().filter_map(|e| e.row).collect();
+    for row in rows {
+        let first = els
+            .iter()
+            .filter(|e| e.row == Some(row))
+            .min_by_key(|e| e.col)
+            .map(|e| e.interp)
+            .unwrap_or(0);
+        // An integer in the row: constant (the only mode integers take).
+        let integer = els.iter().any(|e| e.row == Some(row) && e.comp != 9 && e.interp != 0);
+        let first = if integer && first != 0 { 1 } else { first };
+        for e in els.iter_mut().filter(|e| e.row == Some(row)) {
+            e.interp = first;
         }
     }
 }
