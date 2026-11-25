@@ -765,12 +765,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
-        let mut global_uav = false;
         if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
             host.push(UAV_BARRIER);
-            global_uav = true;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
@@ -787,52 +785,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
-            if global_uav {
-                list.note_uav_barrier_all();
-            }
         }
     }
     0
-}
-
-/// Stands in for the console upscaler's dispatch on title list `this`:
-/// `output` gets the stretched top-left `render` texels of `colour`
-/// ([`crate::over`]). False if nothing was recorded (no host GPU, textures
-/// we do not hold, an output shaders cannot write).
-///
-/// The real dispatch leaves its own state in the list, so the title sets
-/// its own again afterwards; ours is replayed all the same.
-#[cfg(windows)]
-pub fn upscale_stretch(
-    this: *const std::ffi::c_void,
-    colour: *const std::ffi::c_void,
-    output: *const std::ffi::c_void,
-    render: [u32; 2],
-) -> bool {
-    const SHADER_READ: u32 = 0x40;
-    const UNORDERED: u32 = 0x8;
-    let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
-    if this.is_null() || colour.is_null() || output.is_null() {
-        return false;
-    }
-    let mut done = false;
-    with_state(this, |list, state| {
-        let (Some(to), Some(from), Some(host)) = (
-            crate::resource::host_resource(output),
-            crate::resource::host_resource(colour),
-            crate::host::host(),
-        ) else {
-            return;
-        };
-        ensure_state(list, colour, SHADER_READ);
-        ensure_state(list, output, UNORDERED);
-        done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
-        if done {
-            crate::texture::host_written(output);
-        }
-        state.replay(list);
-    });
-    done
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
@@ -889,19 +844,7 @@ extern "system" fn copy_buffer_region(
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
-fn unlike(dst: This, src: This, mapped: bool) -> bool {
-    // A host copy without its largest levels has other subresources and
-    // sizes than the title's texture (`crate::resource::drop_levels`). A
-    // caller that maps subresources (`mapped`) copies level by level to the
-    // levels the host has (`crate::resource::host_subresource`); any other
-    // copy with such a texture is skipped.
-    if !mapped && (crate::resource::dropped(src) > 0 || crate::resource::dropped(dst) > 0) {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(?dst, ?src, "copy with a texture whose host copy leaves out levels skipped")
-        });
-        return true;
-    }
+fn unlike(dst: This, src: This) -> bool {
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -927,10 +870,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            // Host copies that leave out different numbers of levels differ
-            // in shape: copied level by level below.
-            let levelwise = crate::resource::dropped(dst) != crate::resource::dropped(src);
-            if unlike(dst, src, true) {
+            if unlike(dst, src) {
                 return;
             }
             // Two title textures over the same memory have one host
@@ -972,12 +912,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            if levelwise {
-                copy_levels(list, dst, to, src, from);
-            } else {
-                // SAFETY: an open list and live textures.
-                unsafe { list.list.CopyResource(to, from) };
-            }
+            // SAFETY: an open list and live textures.
+            unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -987,42 +923,6 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
-}
-
-/// A whole-texture copy between host copies that leave out different
-/// numbers of levels (`crate::resource::drop_levels`): each title level both
-/// host copies have, at its own index in each. A title level has the same
-/// size in every host copy that has it.
-#[cfg(windows)]
-fn copy_levels(
-    list: &crate::host::HostList,
-    dst: This,
-    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    src: This,
-    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-) {
-    use windows::Win32::Graphics::Direct3D12::{
-        D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        ID3D12Resource,
-    };
-    let location = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: a borrowed pointer the location never releases.
-        pResource: unsafe { std::mem::transmute_copy(texture) },
-        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
-    };
-    let count = crate::resource::title_subresources(dst).min(crate::resource::title_subresources(src));
-    for index in 0..count {
-        let (Some(d), Some(s)) = (
-            crate::resource::host_subresource(dst, index),
-            crate::resource::host_subresource(src, index),
-        ) else {
-            continue;
-        };
-        // SAFETY: an open list and live textures; both subresources exist
-        // and have the title level's size.
-        unsafe { list.list.CopyTextureRegion(&location(to, d), 0, 0, 0, &location(from, s), None) };
-    }
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -1098,19 +998,8 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        // Both locations are mapped to the levels their host copies have
-        // (below), so copies with textures that leave out levels go ahead.
-        if unlike(dst.resource, src.resource, true) {
+        if unlike(dst.resource, src.resource) {
             return;
-        }
-        // Into a host copy without its largest levels: the level it has,
-        // or nothing (`crate::resource::drop_levels`).
-        let mut dst = dst;
-        if dst.kind != FOOTPRINT && crate::resource::dropped(dst.resource) > 0 {
-            match crate::resource::host_subresource(dst.resource, dst.footprint.offset as u32) {
-                Some(index) => dst.footprint.offset = u64::from(index),
-                None => return,
-            }
         }
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
@@ -1143,14 +1032,6 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
-            // From a host copy without its largest levels: the level it
-            // has (the same size as the title's), or nothing.
-            if crate::resource::dropped(src.resource) > 0 {
-                match crate::resource::host_subresource(src.resource, src.footprint.offset as u32) {
-                    Some(index) => from.footprint.offset = u64::from(index),
-                    None => return,
-                }
-            }
             // The same subresource of one host texture on both sides (two
             // title textures over one memory): not a copy the host allows.
             // The states and the copy are left out below; the rest is
@@ -1158,7 +1039,7 @@ extern "system" fn copy_texture_region(
             same = texture.as_raw() == to.as_raw()
                 && src.kind != FOOTPRINT
                 && dst.kind != FOOTPRINT
-                && from.footprint.offset as u32 == dst.footprint.offset as u32;
+                && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
@@ -1257,7 +1138,6 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
-    let index = crate::resource::readback_subresource(src.resource, src.footprint.offset as u32)?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
@@ -1269,7 +1149,6 @@ fn read_back(
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
-    from.footprint.offset = u64::from(index);
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint = footprint;
@@ -1329,7 +1208,7 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src, false) {
+        if unlike(dst, src) {
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
@@ -2142,7 +2021,6 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
-        list.note_uav_barrier_all();
     }
     #[cfg(not(windows))]
     let _ = (this, count);

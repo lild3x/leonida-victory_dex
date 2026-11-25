@@ -368,14 +368,12 @@ pub(crate) struct State {
     depth_bounds: Option<[f32; 2]>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
-    /// Active indirect windows clamped ahead into `HostList`'s windowed
-    /// scratch ring (FIFO eviction keeps 1-to-1 alignment with the ring).
-    windows: Vec<Window>,
+    window: Option<Window>,
     /// With [`jump_windows`]: the argument buffer (its copy's number), kind
     /// and stride of the last window of several records that a draw read
     /// from, and that window's step.
     walk_step: Option<(u64, u32, u32, u32)>,
-    /// Whether an indirect window was opened at the remembered step, and
+    /// Whether [`State::window`] was opened at the remembered step, and
     /// whether a draw has read from it since.
     window_jumped: bool,
     window_read: bool,
@@ -1980,7 +1978,7 @@ impl State {
         // textures (a scene's first minutes) then drains in fewer frames.
         static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(48)
+            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
@@ -2335,9 +2333,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        // It may write the arguments a window holds clamped, and writes UAVs.
-        self.windows.clear();
-        list.note_uav_write();
+        // It may write the arguments a window holds clamped.
+        self.window = None;
         list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -2667,7 +2664,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.draw_ends_window(list);
+        self.window = None;
         if self.may_store() {
             list.gather_close();
         }
@@ -3117,7 +3114,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.draw_ends_window(list);
+        self.window = None;
         if self.may_store() {
             list.gather_close();
         }
@@ -3225,7 +3222,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.draw_ends_window(list);
+        self.window = None;
         if self.may_store() {
             list.gather_close();
         }
@@ -3257,25 +3254,6 @@ impl State {
 }
 
 impl State {
-    /// A direct draw ends the window ([`windows`]). With
-    /// `VICTORY_INDIRECT_WINDOW_DRAWS=1` (off by default) only a draw whose
-    /// shaders can store to buffers does: such a draw may write the
-    /// arguments the window holds clamped, and no other draw touches them
-    /// or the list's scratch buffer.
-    fn draw_ends_window(&mut self, list: &HostList) {
-        static OVER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let over = *OVER.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW_DRAWS").is_some_and(|v| v == "1"));
-        let stores = crate::pipeline::host_pipeline(self.pipeline as This)
-            .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores));
-        if stores {
-            list.note_uav_write();
-        }
-        if !self.windows.is_empty() && (!over || stores) {
-            self.windows.clear();
-            list.reset_indirect_window_ring();
-        }
-    }
-
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -3376,11 +3354,9 @@ impl State {
         }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
-        // buffer. Because windowed and unwindowed clamps use separate 4-slot
-        // rings on `HostList`, non-storing unwindowed draws no longer clobber
-        // cached windows; only UAV-writing shaders or a fresh list reset them.
+        // buffer. Anything else ends the window: it uses the scratch buffer
+        // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
-        const WINDOW_SLOTS: usize = 2;
         let offset = args.offset(arguments);
         // A dispatch that may have more groups than the host runs in one
         // dimension, by a program that takes the number of its first group.
@@ -3389,18 +3365,16 @@ impl State {
         } else {
             None
         };
-        let p_stores = p.stages.iter().any(|stage| stage.translated().stores);
         let windowed = windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
-            && !p_stores;
+            && !p.stages.iter().any(|stage| stage.translated().stores);
         // Another host list (a new one after a cut, or this one after its
-        // reset) has another scratch pool, or this one's with old bytes.
+        // reset) has another scratch buffer, or this one's with old bytes.
         let first_on_list = list.first_use(WINDOW_USE);
-        if first_on_list || kind == DISPATCH || p_stores {
-            self.windows.clear();
-            list.reset_indirect_window_ring();
+        if !windowed || first_on_list {
+            self.window = None;
         }
         if !windowed {
             // A dispatch, or shaders that store to buffers: arguments may
@@ -3422,7 +3396,7 @@ impl State {
         } else if first_on_list {
             5
         } else {
-            match self.windows.last() {
+            match &self.window {
                 None => 6,
                 Some(w) if !(w.copy == args.id() && w.kind == kind && w.stride == stride) => 6,
                 Some(w) if offset >= w.base && (offset - w.base) % u64::from(w.step) == 0 => 8,
@@ -3430,20 +3404,12 @@ impl State {
             }
         };
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = windowed
-            .then(|| {
-                self.windows
-                    .iter()
-                    .rev()
-                    .find(|w| {
-                        same(w)
-                            && offset >= w.base
-                            && (offset - w.base) % u64::from(w.step) == 0
-                            && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
-                    })
-                    .map(|w| (w.scratch.clone(), offset - w.base, w.step))
-            })
-            .flatten();
+        let hit = self
+            .window
+            .as_ref()
+            .filter(|w| same(w) && offset >= w.base)
+            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
         let gathered = if hit.is_none() && windowed && gathers() {
@@ -3474,7 +3440,7 @@ impl State {
                 WINDOW_WHY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !self.window_read {
                     self.window_read = true;
-                    if let Some(w) = self.windows.iter().rev().find(|w| w.records > 1) {
+                    if let Some(w) = self.window.as_ref().filter(|w| w.records > 1) {
                         self.walk_step = Some((w.copy, w.kind, w.stride, w.step));
                     }
                 }
@@ -3505,26 +3471,22 @@ impl State {
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
                 // after it are clamped with it.
-                let (step, records) = if windowed {
-                    match self.windows.iter().rev().find(|w| same(w)) {
-                        Some(w) => {
-                            let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                            let step = offset.saturating_sub(last);
-                            let walks = step >= u64::from(stride)
-                                && step <= 256
-                                && step % 4 == 0
-                                && (w.records == 1 || step == u64::from(w.step));
-                            if walks {
-                                let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                                (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
-                            } else {
-                                (stride, max)
-                            }
+                let (step, records) = match &self.window {
+                    Some(w) if windowed && same(w) => {
+                        let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
+                        let step = offset.saturating_sub(last);
+                        let walks = step >= u64::from(stride)
+                            && step <= 256
+                            && step % 4 == 0
+                            && (w.records == 1 || step == u64::from(w.step));
+                        if walks {
+                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                        } else {
+                            (stride, max)
                         }
-                        None => (stride, max),
                     }
-                } else {
-                    (stride, max)
+                    _ => (stride, max),
                 };
                 // A record that would be clamped alone, on a buffer whose
                 // step is remembered: the window the next record would
@@ -3550,25 +3512,17 @@ impl State {
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-                // Windowed clamps always allocate from `HostList`'s 4-slot
-                // windowed scratch ring (strict 1-to-1 FIFO with `self.windows`).
+                // More than the record asked for: a window clamped ahead,
+                // whose unfilled slots must not spend the list's budget.
                 let bounded = if parts.is_some() {
                     crate::indirect::bound_split(list, (&args.buffer, offset))
-                } else if windowed {
-                    crate::indirect::bound_window(
-                        list,
-                        (&args.buffer, offset),
-                        (kind, step, records),
-                        records > 1,
-                    )
+                } else if windowed && records > 1 {
+                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
                 let Some(bounded) = bounded else {
-                    if windowed {
-                        self.windows.clear();
-                        list.reset_indirect_window_ring();
-                    }
+                    self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
@@ -3589,7 +3543,7 @@ impl State {
                                 args.id(),
                                 args.left(arguments),
                                 offset as i64 - last_offset as i64,
-                                match self.windows.last() {
+                                match &self.window {
                                     Some(w) => format!("buffer {} kind {} stride {} base {:#x} step {} records {} (this record is {} bytes from its base)", w.copy, w.kind, w.stride, w.base, w.step, w.records, offset as i64 - w.base as i64),
                                     None => "none".to_string(),
                                 }
@@ -3599,20 +3553,15 @@ impl State {
                 }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
-                if windowed {
-                    if self.windows.len() >= WINDOW_SLOTS {
-                        self.windows.remove(0);
-                    }
-                    self.windows.push(Window {
-                        copy: args.id(),
-                        kind,
-                        stride,
-                        step,
-                        base: offset,
-                        records,
-                        scratch: bounded.clone(),
-                    });
-                }
+                self.window = windowed.then(|| Window {
+                    copy: args.id(),
+                    kind,
+                    stride,
+                    step,
+                    base: offset,
+                    records,
+                    scratch: bounded.clone(),
+                });
                 (bounded, 0)
             }
         };
@@ -3664,9 +3613,6 @@ impl State {
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
-        if kind == DISPATCH || p_stores {
-            list.note_uav_write();
-        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
