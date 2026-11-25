@@ -27,7 +27,8 @@ pub(crate) fn listed(n: u64) -> bool {
                 .filter_map(|f| f.trim().parse().ok())
                 .collect()
         })
-        .contains(&n);
+        .contains(&n)
+        || HOTKEY.lock().unwrap_or_else(|e| e.into_inner()).contains(&n);
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
@@ -123,9 +124,34 @@ fn world_on() -> bool {
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// shortcut: frames asked for with F11 while the title runs (`VICTORY_CAPTURE`
+/// set): the two after the press are saved like listed ones (picture, the
+/// `-ops.txt` list of draws with their shaders and drops, and with
+/// `VICTORY_DUMP_TARGETS` every target they write).
+static HOTKEY: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// Looks at F11 once per presented frame.
+fn poll_hotkey(frame: u64) {
+    if folder().is_none() {
+        return;
+    }
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F11};
+    // SAFETY: a plain query of the key's state.
+    let state = unsafe { GetAsyncKeyState(i32::from(VK_F11.0)) };
+    // Or a file `capturar.now` in the folder (scripts ask without a key).
+    let asked = folder().map(|f| f.join("capturar.now")).is_some_and(|p| std::fs::remove_file(p).is_ok());
+    // The low bit: pressed since the last query.
+    if state & 1 != 0 || asked {
+        let frames = [frame + 2, frame + 3];
+        HOTKEY.lock().unwrap_or_else(|e| e.into_inner()).extend(frames);
+        tracing::info!(?frames, "F11: these frames are captured (picture, draws, targets)");
+    }
+}
+
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    poll_hotkey(frame);
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
     if world_on()
