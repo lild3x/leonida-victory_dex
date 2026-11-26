@@ -8159,8 +8159,10 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        // The window says "Secret <the title's own caption> | Blacksi Port" (the frame rate is
+        // on the overlay, F10).
+        let _ = (fps, ms, draws);
+        let mut text: Vec<u16> = "Secret ".encode_utf16().chain(caption.iter().copied()).chain(" | Blacksi Port".encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
