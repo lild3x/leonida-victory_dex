@@ -8541,6 +8541,75 @@ impl Host {
         );
     }
 
+    /// With `VICTORY_GPU_UPLOAD=1` and a card that has them (Resizable BAR,
+    /// `D3D12_FEATURE_D3D12_OPTIONS16`): a buffer in the card's own memory
+    /// that the CPU maps (write-combined: writing it is fast, reading it is
+    /// slow), for the CPU's side of a copy kept on the card. Its bytes then
+    /// leave the PC's memory, and the card's own copy of them reads them
+    /// from its memory, not over the bus. None (the caller makes a
+    /// [`Self::shared_buffer`]) without the switch or the support.
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        static ON: OnceLock<bool> = OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            if !std::env::var_os("VICTORY_GPU_UPLOAD").is_some_and(|v| v == "1") {
+                return false;
+            }
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a plain query into a struct of the size given.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o16).cast(),
+                    size_of_val(&o16) as u32,
+                )
+            };
+            let on = asked.is_ok() && o16.GPUUploadHeapSupported.as_bool();
+            tracing::info!(
+                on,
+                "the CPU's sides of copies on the card are in the card's memory (VICTORY_GPU_UPLOAD=1; needs Resizable BAR)"
+            );
+            on
+        });
+        if !on {
+            return None;
+        }
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => {
+                crate::census::made(2, size);
+                MADE[2].fetch_add(1, Ordering::Relaxed);
+                MADE[3].fetch_add(size, Ordering::Relaxed);
+                Some((buffer?, data.cast()))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no buffer in the card's memory the CPU maps: in the PC's instead");
+                None
+            }
+        }
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in

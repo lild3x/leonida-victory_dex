@@ -3793,11 +3793,17 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        // memory, and the one made here is the CPU's side: in the card's
+        // memory too with `VICTORY_GPU_UPLOAD=1` (`Host::gpu_upload_buffer`).
+        let on_card = card_for(size);
+        let upload = if on_card.is_some() { host()?.gpu_upload_buffer(size) } else { None };
+        let (buffer, data) = match upload {
+            Some(made) => made,
+            None => host()?.shared_buffer(size)?,
+        };
+        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        let (buffer, card) = match on_card {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -4015,11 +4021,17 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // buffer there, and the one made here is the CPU's side (in the card's
+    // memory too with `VICTORY_GPU_UPLOAD=1`).
+    let on_card = window_card_for(len);
+    let upload = if on_card.is_some() { host()?.gpu_upload_buffer(len) } else { None };
+    let (buffer, data) = match upload {
+        Some(made) => made,
+        None => host()?.shared_buffer(len)?,
+    };
+    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+    let (buffer, card) = match on_card {
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
