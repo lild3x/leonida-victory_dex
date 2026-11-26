@@ -87,6 +87,8 @@ mod overlay;
 mod pixels;
 #[cfg(windows)]
 mod layers;
+#[cfg(windows)]
+mod ambient;
 
 #[cfg(windows)]
 pub use host::on_failure;
