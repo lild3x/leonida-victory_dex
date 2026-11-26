@@ -58,6 +58,16 @@ struct Ray {
     inverse: [V; 3],
 }
 
+/// `VICTORY_BVH_MISS=1` (off by default; from trustno1-coder/VIctory-NVIDIA):
+/// the node test misses every node. While the structure builder is off the
+/// structures are never built, and a walk of what lies in their memory is
+/// not the console's: a box returns no child and a triangle the miss, so a
+/// walk ends at its first node.
+fn bvh_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -189,11 +199,19 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        let boxes = if bvh_miss() {
+            [self.s.m.i32(bvh::NONE); 4]
+        } else {
+            self.bvh_boxes(at, kind, &ray, sort)
+        };
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
-        let triangle = self.bvh_triangle(at, kind, &ray);
+        let triangle = if bvh_miss() {
+            bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
+        } else {
+            self.bvh_triangle(at, kind, &ray)
+        };
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
