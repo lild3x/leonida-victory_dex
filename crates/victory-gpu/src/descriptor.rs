@@ -827,6 +827,50 @@ fn wait_for(resource: usize, handle: u64) {
 /// textures made since the last call. Called before a submission runs, by
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
+/// `VICTORY_TEXTURE_EVICT`: every slot of a shader-visible view heap that
+/// views one of these host textures (COM pointer to title texture) is made a
+/// null view and noted as waiting for that title texture ([`wait_for`]): when
+/// the texture gets a host copy again, [`make_waiting`] writes the slot anew.
+/// Returns the slots let go (title texture, slot handle), to be passed to
+/// [`note_waiting`] once those host copies are gone.
+#[cfg(windows)]
+pub(crate) fn release_slots_of(textures: &std::collections::HashMap<usize, usize>) -> Vec<(usize, u64)> {
+    if textures.is_empty() {
+        return Vec::new();
+    }
+    let raws: std::collections::HashSet<usize> = textures.keys().copied().collect();
+    let heaps: Vec<(u64, usize)> = SHADER_HEAPS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|&(start, _, at)| (start, at))
+        .collect();
+    let mut waits = Vec::new();
+    for (start, at) in heaps {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue;
+        };
+        for (index, raw) in host.drop_views_of(&raws) {
+            if let Some(&resource) = textures.get(&raw) {
+                waits.push((resource, start + u64::from(index) * u64::from(step)));
+            }
+        }
+    }
+    waits
+}
+
+/// The slots [`release_slots_of`] let go wait for their textures' next host
+/// copies (called after those copies are gone: a copy still there would
+/// write the slot again at once).
+#[cfg(windows)]
+pub(crate) fn note_waiting(waits: Vec<(usize, u64)>) {
+    for (resource, handle) in waits {
+        wait_for(resource, handle);
+    }
+}
+
 pub(crate) fn make_waiting() {
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
     for resource in made {

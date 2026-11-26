@@ -1771,6 +1771,13 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
+    // `VICTORY_TEXTURE_EVICT=1` (off by default): with the card's memory
+    // short, idle copies that only descriptor slots still hold go too. Their
+    // slots become null views waiting for the next copy
+    // (`crate::descriptor::release_slots_of`), so that new textures find
+    // room instead of waiting for it (unmade, they read black) while ones
+    // no frame uses keep it.
+    let (evicted, waits) = evict_slot_held(&all, idle_ms, IDLE_FRAMES);
     for &at in all.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
@@ -1783,7 +1790,7 @@ pub(crate) fn let_go_idle() {
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+                    && (crate::host::references(&host.texture) == 1 || evicted.contains(&at))
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -1806,6 +1813,12 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    // The copies are gone: their slots wait for the next ones.
+    let slots = waits.len();
+    crate::descriptor::note_waiting(waits);
+    if slots > 0 {
+        EVICTED_SLOTS.fetch_add(slots as u64, Relaxed);
+    }
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -1815,6 +1828,58 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Slots [`evict_slot_held`] let go since the start (for the log).
+#[cfg(windows)]
+pub(crate) static EVICTED_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_TEXTURE_EVICT=1`: under pressure on the card's memory (no room
+/// for new texture copies, or nine tenths of the budget used), the idle host
+/// copies of textures the title fills that no list holds but some slot does,
+/// up to 512 MB a sweep, are taken out of their slots. Returns those title
+/// textures (the sweep then lets their copies go) and the slots, for
+/// [`crate::descriptor::note_waiting`] once the copies are gone.
+#[cfg(windows)]
+fn evict_slot_held(all: &std::collections::BTreeSet<usize>, idle_ms: u64, idle_frames: u64) -> (std::collections::HashSet<usize>, Vec<(usize, u64)>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MOST: u64 = 512 << 20;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let none = (std::collections::HashSet::new(), Vec::new());
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_EVICT").is_some_and(|v| v == "1")) {
+        return none;
+    }
+    let pressed = !room()
+        || crate::host::host()
+            .and_then(|h| h.video_memory())
+            .is_some_and(|[budget, used, ..]| budget > 0 && used >= budget / 10 * 9);
+    if !pressed {
+        return none;
+    }
+    let mut by_texture = std::collections::HashMap::new();
+    let mut bytes = 0u64;
+    for &at in all {
+        if bytes >= MOST {
+            break;
+        }
+        // SAFETY: as in `let_go_idle`, under the same table lock.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref()
+            && crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
+            && std::sync::Arc::strong_count(host) == 1
+            && crate::host::references(&host.texture) > 1
+        {
+            by_texture.insert(windows::core::Interface::as_raw(&host.texture) as usize, at);
+            bytes += host.bytes;
+        }
+    }
+    let waits = crate::descriptor::release_slots_of(&by_texture);
+    let held: std::collections::HashSet<usize> = waits.iter().map(|&(resource, _)| resource).collect();
+    (held, waits)
 }
 
 /// For the memory line: the host copies the sweep never lets go

@@ -1098,21 +1098,29 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
+        // Search from `next` on, then from the start; a run cannot wrap past
+        // the end. Free runs are found with `memchr` over the flags (a bool
+        // is one byte, 0 or 1): from a free slot to the next taken one, at
+        // SIMD speed (it walked slot by slot: 25-30 ms a frame searching in
+        // gameplay, 32,000 tables a frame).
+        // SAFETY: `bool` has the size and alignment of `u8` and holds 0 or 1.
+        let flags: &[u8] = unsafe { std::slice::from_raw_parts(taken.as_ptr().cast::<u8>(), taken.len()) };
+        let end = (self.dynamic as usize).min(flags.len());
+        let start = (*next as usize).min(end);
         let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
+        if enough {
+            'search: for (from, to) in [(start, end), (0, start)] {
+                let mut at = from;
+                while at < to {
+                    let Some(free) = memchr::memchr(0, &flags[at..to]) else { break };
+                    let first = at + free;
+                    let len = memchr::memchr(1, &flags[first..to]).unwrap_or(to - first);
+                    if len >= n {
+                        found = Some(first);
+                        break 'search;
+                    }
+                    at = first + len;
+                }
             }
         }
         let Some(first) = found else {
@@ -1716,6 +1724,34 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
+    }
+
+    /// `VICTORY_TEXTURE_EVICT`: the slots that view one of the host textures
+    /// in `textures` (by their COM pointers) are made null views and let the
+    /// texture go (retired: a running submission may still read it). Returns
+    /// each such slot and the texture it viewed, so that the caller notes the
+    /// slot as waiting for that texture's next host copy.
+    pub(crate) fn drop_views_of(&self, textures: &std::collections::HashSet<usize>) -> Vec<(u32, usize)> {
+        if self.sampler || textures.is_empty() {
+            return Vec::new();
+        }
+        let mut dropped = Vec::new();
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, slot) in kept.iter_mut().enumerate() {
+            let Some(raw) = slot.as_ref().map(|r| windows::core::Interface::as_raw(r) as usize) else {
+                continue;
+            };
+            if !textures.contains(&raw) {
+                continue;
+            }
+            let index = index as u32;
+            null_view(self.cpu(index));
+            if let Some(old) = slot.take() {
+                crate::host::retire(old);
+            }
+            dropped.push((index, raw));
+        }
+        dropped
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
