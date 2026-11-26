@@ -1029,7 +1029,7 @@ unsafe fn skip_watchdog(info: *mut EXCEPTION_POINTERS) -> bool {
         return false;
     }
     let rip = ctx.Rip as usize;
-    let mut code = [0u8; 12];
+    let mut code = [0u8; 13];
     if !crate::console_insn::readable_bytes(rip, &mut code) {
         return false;
     }
@@ -1039,7 +1039,10 @@ unsafe fn skip_watchdog(info: *mut EXCEPTION_POINTERS) -> bool {
     if !form {
         return false;
     }
-    ctx.Rip += (at + 11) as u64;
+    // At +0x2215c35 the store is followed by an `int3` and the watchdog's
+    // loop goes on after it: that trap is stepped over too.
+    let trap = u64::from(code[at + 11] == 0xCC);
+    ctx.Rip += (at + 11) as u64 + trap;
     static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
         tracing::warn!(at = format_args!("{rip:#x}"), "the title's watchdog fired: stepped over (VICTORY_NO_WATCHDOG=1)");
