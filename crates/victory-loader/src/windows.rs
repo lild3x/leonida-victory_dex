@@ -84,6 +84,18 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
+    // Opt-in title patches (render scale, the title's own upscaler), each
+    // checked against the 1.0.2.1 hash and its bytes (`crate::hooks`).
+    // SAFETY: just mapped, and no title code has run.
+    let levers = unsafe { crate::hooks::resolution_levers(loaded.base(), &prepared.original_hash) };
+    if levers > 0 {
+        tracing::warn!(
+            applied = levers,
+            "title resolution levers ({}, {})",
+            crate::hooks::RENDER_SCALE_ENV,
+            crate::hooks::OWN_UPSCALER_ENV
+        );
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),
