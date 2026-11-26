@@ -494,6 +494,7 @@ fn emit_any(
         && native.wave64
         && lower::host_max_wave() == 32
         && pairs_on()
+        && !pairs_skipped(c)
     {
         let again = paired(c, native, p, io, res);
         if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
@@ -507,6 +508,24 @@ fn emit_any(
         }
     }
     r.map(|(shader, _)| shader)
+}
+
+/// Diagnostics: `VICTORY_WAVE_PAIRS_SKIP=<names>` (comma-separated, off by
+/// default) keeps the paired form from the programs whose container holds one
+/// of those names (a function name such as `CS_ComputeLuminanceBilateralGrid`):
+/// they stay refused on 32-lane hosts, as without the paired form, so a wrong
+/// result can be pinned to the programs that take it.
+fn pairs_skipped(c: &Container) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_PAIRS_SKIP")
+            .map(|v| v.split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| n.as_bytes().to_vec()).collect())
+            .unwrap_or_default()
+    });
+    !names.is_empty()
+        && c.parts.iter().any(|part| {
+            names.iter().any(|n| part.data.windows(n.len()).any(|w| w == n.as_slice()))
+        })
 }
 
 /// Whether console wave64 compute programs may take the paired form ([`paired`]):
@@ -635,7 +654,7 @@ fn emit_forms(
         // last for it (`emit_any`). (`VICTORY_WAVE_PAIRS=0` turns the paired form off here
         // too.)
         let exactly = |approximate: Result<(HostShader, Option<u32>), ShaderError>| {
-            if pairs_on() {
+            if pairs_on() && !pairs_skipped(c) {
                 let again = paired(c, native, p, io, res);
                 report("paired lanes, before an approximate form", &again);
                 if again.is_ok() {
